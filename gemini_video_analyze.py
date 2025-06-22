@@ -1,0 +1,105 @@
+import os
+from dotenv import load_dotenv
+import google.generativeai as genai
+import time
+
+load_dotenv()
+API_KEY = os.environ["GEMINI_API_KEY"]
+
+def wait_for_file_active(file_obj, timeout=300, interval=2):
+    """ファイルがACTIVEになるまで待機"""
+    start = time.time()
+    while True:
+        file_obj = genai.get_file(file_obj.name)
+        state = file_obj.to_dict()['state']
+        if str(state).upper() == "ACTIVE":
+            return file_obj
+        if time.time() - start > timeout:
+            raise TimeoutError(f"ファイルがACTIVEになりませんでした（最終state: {state}）")
+        time.sleep(interval)
+
+def generate(video_path: str):
+    genai.configure(api_key=API_KEY)
+
+    # ファイルをアップロード（保存期間は48時間）
+    video_file = genai.upload_file(
+        path=video_path,
+        mime_type="video/mp4",
+    )
+    video_file = wait_for_file_active(video_file)
+
+    model_name = "models/gemini-2.5-flash-lite-preview-06-17"
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction="あなたは 3D 可視化と幾何解析に熟達した AI アシスタントです。\n寸法計測・欠陥検出・物体カテゴリ分類・総合解析を高精度かつ論理的に実施してください。"
+    )
+
+    user_prompt = """
+目的:
+  この 3D モデルが「何を表しているか」「だいたいのサイズ」「気になる欠陥」を知りたい。
+
+入力データ:
+  - turntable.mp4
+
+お願いしたいこと:
+  1. モデルが何のオブジェクトかを 1 行で推定してください。  
+  2. 幅×奥行×高さ（cm 単位）をおおよそで構いませんので出してください。  
+  3. 主要な特徴／パーツを 3 つ挙げてください。  
+  4. “穴・欠け・裏面ポリゴン” など気になる箇所があれば箇条書きで。  
+  5. まとめを 80 字以内で書いてください。
+
+出力フォーマット（厳守）:
+
+### オブジェクト推定
+- **種類**: …
+
+### 寸法 (cm, おおよそ)
+| 幅 | 奥行 | 高さ |
+|----|------|------|
+|    |      |      |
+
+### 主要特徴
+1. …
+2. …
+3. …
+
+### 欠陥・注意点
+- …
+
+### まとめ
+…
+
+制約:
+- 日本語で回答。
+- 表の罫線や見出しは変更しないでください。
+- 寸法は半角数字。
+- 追加で質問があれば最後に「質問: …?」と書き、私の返答を待ってから続けてください。
+
+
+⸻
+
+使い方ガイド
+	1.	モデルを画像／動画にして渡す
+Gemini（画像入力対応版）や Vision-capable ChatGPT に、上記ファイルをアップロード。
+	•	OBJ/FBX のまま直接渡せない場合は「ターンテーブル動画＋静止画」のセットにするのが手軽です。
+	2.	プロンプトを送信
+目的・入力・フォーマット部分をコピーして必要箇所だけ書き換え、モデル画像と一緒に貼り付けます。
+	3.	追記の指示が来たら応答
+LLM が「もっと解像度の高いズームが欲しい」など聞いてきたら、追加画像を渡して再実行すれば精度が上がります。
+
+⸻
+
+これで 「何のモデル？どれくらいの大きさ？どこが特徴？」 を一度に把握できる
+“普通の 3D モデル解析” にちょうど良いシンプルプロンプトになります。
+"""
+
+    response = model.generate_content(
+        [
+            video_file,
+            user_prompt
+        ]
+    )
+    print(response.text)
+
+if __name__ == "__main__":
+    generate("/path/to/your/video.mp4")  # 動画ファイルパスを指定
