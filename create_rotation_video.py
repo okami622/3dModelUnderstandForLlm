@@ -9,6 +9,12 @@ from typing import List, Dict, Tuple, Optional
 import cv2
 from PIL import Image, ImageDraw, ImageFont
 
+# モジュールのインポート
+from texture_loader import TextureLoader
+from x3d_loader import X3DLoader
+from color_generator import ColorGenerator
+from cross_section_processor import CrossSectionProcessor
+
 class Model3DVideoCreator:
     """3Dモデルの回転動画作成クラス - Gemini分析用に最適化"""
     
@@ -39,6 +45,12 @@ class Model3DVideoCreator:
         self.enhanced_lighting = True
         self.use_depth_shading = True
         self.background_color = [248, 248, 248]  # 高コントラスト背景
+        
+        # モジュールの初期化
+        self.texture_loader = TextureLoader()
+        self.x3d_loader = X3DLoader()
+        self.color_generator = ColorGenerator()
+        self.cross_section_processor = CrossSectionProcessor()
     
         
     def load_model(self, model_path: str) -> Optional[trimesh.Trimesh]:
@@ -57,7 +69,7 @@ class Model3DVideoCreator:
         try:
             # X3D形式の特別な処理
             if model_path.suffix.lower() == '.x3d':
-                mesh = self._load_x3d_file(str(model_path))
+                mesh = self.x3d_loader.load_x3d_file(str(model_path))
                 if mesh is None:
                     return None
             # CAD形式の特別な処理
@@ -71,21 +83,8 @@ class Model3DVideoCreator:
                     print("Note: CAD formats may require additional libraries (FreeCAD, opencascade)")
                     return None
             else:
-                # テクスチャを持つフォーマットの特別処理
-                if model_path.suffix.lower() == '.obj':
-                    mesh = self._load_obj_with_textures(str(model_path))
-                elif model_path.suffix.lower() in ['.gltf', '.glb']:
-                    mesh = self._load_gltf_with_textures(str(model_path))
-                elif model_path.suffix.lower() == '.dae':
-                    mesh = self._load_dae_with_textures(str(model_path))
-                elif model_path.suffix.lower() == '.ply':
-                    mesh = self._load_ply_with_textures(str(model_path))
-                elif model_path.suffix.lower() == '.3mf':
-                    mesh = self._load_3mf_with_textures(str(model_path))
-                else:
-                    mesh = trimesh.load(str(model_path))
-                    # 一般的なテクスチャファイルを探す
-                    mesh = self._try_find_generic_textures(mesh, str(model_path))
+                # テクスチャローダーを使用
+                mesh = self.texture_loader.load_model_with_textures(str(model_path))
             
             if isinstance(mesh, trimesh.Scene):
                 mesh = mesh.dump(concatenate=True)
@@ -102,548 +101,6 @@ class Model3DVideoCreator:
             if model_path.suffix.lower() in ['.step', '.stp', '.iges', '.igs']:
                 print("Tip: Try converting CAD files to STL or OBJ format for better compatibility")
             return None
-    
-    def _load_x3d_file(self, file_path: str) -> Optional[trimesh.Trimesh]:
-        """X3Dファイルを読み込む"""
-        print(f"Attempting to load X3D file: {file_path}")
-        
-        try:
-            import xml.etree.ElementTree as ET
-            
-            # X3Dファイルをパース
-            tree = ET.parse(file_path)
-            root = tree.getroot()
-            
-            vertices = []
-            faces = []
-            
-            # IndexedFaceSetを探す
-            for indexed_face_set in root.iter():
-                if 'IndexedFaceSet' in indexed_face_set.tag:
-                    # Coordinateノードを探す
-                    coordinate_node = None
-                    for child in indexed_face_set:
-                        if 'Coordinate' in child.tag:
-                            coordinate_node = child
-                            break
-                    
-                    if coordinate_node is not None and 'point' in coordinate_node.attrib:
-                        # 頂点座標を抽出
-                        points_str = coordinate_node.attrib['point']
-                        point_values = [float(x) for x in points_str.replace(',', ' ').split()]
-                        
-                        # 3つずつグループ化してx,y,z座標にする
-                        for i in range(0, len(point_values), 3):
-                            if i + 2 < len(point_values):
-                                vertices.append([point_values[i], point_values[i+1], point_values[i+2]])
-                    
-                    # 面のインデックスを抽出
-                    if 'coordIndex' in indexed_face_set.attrib:
-                        indices_str = indexed_face_set.attrib['coordIndex']
-                        indices = [int(x) for x in indices_str.replace(',', ' ').split() if x.strip() and x.strip() != '-1']
-                        
-                        # 3つずつグループ化して三角形の面にする
-                        for i in range(0, len(indices), 3):
-                            if i + 2 < len(indices):
-                                faces.append([indices[i], indices[i+1], indices[i+2]])
-            
-            # Shape > Geometry > IndexedFaceSetのパターンも確認
-            for shape in root.iter():
-                if 'Shape' in shape.tag:
-                    for geometry in shape:
-                        if 'Geometry' in geometry.tag or 'IndexedFaceSet' in geometry.tag:
-                            self._extract_x3d_geometry(geometry, vertices, faces)
-            
-            if vertices and faces:
-                vertices = np.array(vertices)
-                faces = np.array(faces)
-                
-                # 無効な面インデックスを除去
-                valid_faces = []
-                for face in faces:
-                    if all(0 <= idx < len(vertices) for idx in face):
-                        valid_faces.append(face)
-                
-                if valid_faces:
-                    faces = np.array(valid_faces)
-                    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-                    print(f"✓ X3D converted to mesh: {len(vertices)} vertices, {len(faces)} faces")
-                    return mesh
-                else:
-                    print("⚠️  No valid faces found in X3D file")
-            else:
-                print("⚠️  No geometry found in X3D file")
-                
-        except Exception as e:
-            print(f"⚠️  Failed to load X3D file: {e}")
-            
-        return None
-    
-    def _extract_x3d_geometry(self, geometry_node, vertices, faces):
-        """X3Dジオメトリノードから頂点と面を抽出"""
-        try:
-            # 直接的なIndexedFaceSet
-            if 'IndexedFaceSet' in geometry_node.tag:
-                self._process_x3d_indexed_face_set(geometry_node, vertices, faces)
-            
-            # 子ノードをチェック
-            for child in geometry_node:
-                if 'IndexedFaceSet' in child.tag:
-                    self._process_x3d_indexed_face_set(child, vertices, faces)
-                elif 'Coordinate' in child.tag and 'point' in child.attrib:
-                    # 独立したCoordinateノードの処理
-                    pass  # IndexedFaceSetと組み合わせて処理される
-                    
-        except Exception as e:
-            print(f"Warning: Error processing X3D geometry node: {e}")
-    
-    def _process_x3d_indexed_face_set(self, face_set_node, vertices, faces):
-        """IndexedFaceSetノードを処理"""
-        try:
-            coordinate_node = None
-            
-            # Coordinateノードを探す
-            for child in face_set_node:
-                if 'Coordinate' in child.tag:
-                    coordinate_node = child
-                    break
-            
-            # 頂点座標を抽出
-            if coordinate_node is not None and 'point' in coordinate_node.attrib:
-                points_str = coordinate_node.attrib['point']
-                point_values = [float(x) for x in points_str.replace(',', ' ').split()]
-                
-                vertex_start_idx = len(vertices)
-                
-                # 3つずつグループ化
-                for i in range(0, len(point_values), 3):
-                    if i + 2 < len(point_values):
-                        vertices.append([point_values[i], point_values[i+1], point_values[i+2]])
-                
-                # 面のインデックスを抽出
-                if 'coordIndex' in face_set_node.attrib:
-                    indices_str = face_set_node.attrib['coordIndex']
-                    # -1で区切られた面のインデックス
-                    face_groups = indices_str.replace(',', ' ').split('-1')
-                    
-                    for face_group in face_groups:
-                        indices = [int(x) for x in face_group.split() if x.strip()]
-                        
-                        if len(indices) >= 3:
-                            # 三角形に分割（ファン三角分割）
-                            for i in range(1, len(indices) - 1):
-                                face = [
-                                    vertex_start_idx + indices[0],
-                                    vertex_start_idx + indices[i],
-                                    vertex_start_idx + indices[i + 1]
-                                ]
-                                faces.append(face)
-                                
-        except Exception as e:
-            print(f"Warning: Error processing IndexedFaceSet: {e}")
-    
-    def _load_obj_with_textures(self, obj_path: str) -> Optional[trimesh.Trimesh]:
-        """OBJファイルをテクスチャ付きで読み込む"""
-        print(f"Loading OBJ with textures: {obj_path}")
-        
-        try:
-            # まず通常の方法で読み込み
-            mesh = trimesh.load(obj_path)
-            
-            if isinstance(mesh, trimesh.Scene):
-                mesh = mesh.dump(concatenate=True)
-            
-            # MTLファイルを探す
-            obj_path = Path(obj_path)
-            mtl_path = obj_path.with_suffix('.mtl')
-            
-            # 同じディレクトリでMTLファイルを探す
-            if not mtl_path.exists():
-                # 同じ名前のディレクトリ内を探す
-                dir_path = obj_path.parent / obj_path.stem
-                if dir_path.exists():
-                    for mtl_file in dir_path.glob("*.mtl"):
-                        mtl_path = mtl_file
-                        break
-                
-                # 親ディレクトリ内も探す
-                if not mtl_path.exists():
-                    for mtl_file in obj_path.parent.glob("*.mtl"):
-                        mtl_path = mtl_file
-                        break
-            
-            if mtl_path.exists():
-                print(f"Found MTL file: {mtl_path}")
-                # MTLファイルを解析してテクスチャを適用
-                mesh = self._apply_mtl_textures(mesh, mtl_path)
-            else:
-                print("No MTL file found")
-            
-            return mesh
-            
-        except Exception as e:
-            print(f"Error loading OBJ with textures: {e}")
-            # フォールバック: 通常の読み込み
-            try:
-                return trimesh.load(obj_path)
-            except:
-                return None
-    
-    def _apply_mtl_textures(self, mesh: trimesh.Trimesh, mtl_path: Path) -> trimesh.Trimesh:
-        """MTLファイルからテクスチャ情報を適用"""
-        try:
-            print(f"Parsing MTL file: {mtl_path}")
-            
-            # MTLファイルを解析
-            materials = self._parse_mtl_file(mtl_path)
-            
-            if materials:
-                print(f"Found {len(materials)} materials in MTL")
-                
-                # 最初のマテリアルを使用（複数マテリアルの場合は後で改善可能）
-                material_name = list(materials.keys())[0]
-                material = materials[material_name]
-                
-                print(f"Using material: {material_name}")
-                
-                # 拡散反射テクスチャを適用
-                if 'map_Kd' in material:
-                    texture_path = mtl_path.parent / material['map_Kd']
-                    if texture_path.exists():
-                        print(f"Loading texture: {texture_path}")
-                        mesh = self._apply_texture_to_mesh(mesh, texture_path)
-                    else:
-                        print(f"Texture file not found: {texture_path}")
-                
-                # 拡散反射色を適用
-                elif 'Kd' in material:
-                    color = material['Kd']
-                    print(f"Applying diffuse color: {color}")
-                    mesh = self._apply_color_to_mesh(mesh, color)
-            
-            return mesh
-            
-        except Exception as e:
-            print(f"Error applying MTL textures: {e}")
-            return mesh
-    
-    def _parse_mtl_file(self, mtl_path: Path) -> Dict:
-        """MTLファイルを解析"""
-        materials = {}
-        current_material = None
-        
-        try:
-            with open(mtl_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    
-                    parts = line.split()
-                    if not parts:
-                        continue
-                    
-                    command = parts[0]
-                    
-                    if command == 'newmtl':
-                        current_material = parts[1]
-                        materials[current_material] = {}
-                    
-                    elif current_material and command in ['Kd', 'Ka', 'Ks']:
-                        # 拡散反射色、環境反射色、鏡面反射色
-                        if len(parts) >= 4:
-                            materials[current_material][command] = [
-                                float(parts[1]), float(parts[2]), float(parts[3])
-                            ]
-                    
-                    elif current_material and command == 'map_Kd':
-                        # 拡散反射テクスチャ
-                        materials[current_material][command] = parts[1]
-                    
-                    elif current_material and command in ['map_Ka', 'map_Ks', 'map_Bump', 'bump']:
-                        # その他のテクスチャマップ
-                        materials[current_material][command] = parts[1]
-        
-        except Exception as e:
-            print(f"Error parsing MTL file: {e}")
-        
-        return materials
-    
-    def _apply_texture_to_mesh(self, mesh: trimesh.Trimesh, texture_path: Path) -> trimesh.Trimesh:
-        """テクスチャ画像をメッシュに適用"""
-        try:
-            from PIL import Image
-            import numpy as np
-            
-            # テクスチャ画像を読み込み
-            texture_image = Image.open(texture_path).convert('RGB')
-            texture_array = np.array(texture_image)
-            
-            print(f"Texture loaded: {texture_array.shape}")
-            
-            # メッシュがUVマッピングを持っている場合
-            if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
-                # UV座標を使って頂点色を計算
-                uv_coords = mesh.visual.uv
-                vertex_colors = []
-                
-                h, w = texture_array.shape[:2]
-                
-                for uv in uv_coords:
-                    # UV座標をテクスチャのピクセル座標に変換
-                    u, v = uv[0], 1.0 - uv[1]  # Vを反転
-                    x = int(np.clip(u * (w - 1), 0, w - 1))
-                    y = int(np.clip(v * (h - 1), 0, h - 1))
-                    
-                    # テクスチャから色を取得
-                    color = texture_array[y, x]
-                    vertex_colors.append([color[0], color[1], color[2], 255])
-                
-                vertex_colors = np.array(vertex_colors)
-                
-                # メッシュに頂点色を設定
-                mesh.visual.vertex_colors = vertex_colors
-                print(f"Applied texture colors to {len(vertex_colors)} vertices")
-            
-            else:
-                print("No UV mapping found, applying average texture color")
-                # UV座標がない場合は平均色を使用
-                avg_color = np.mean(texture_array.reshape(-1, 3), axis=0)
-                mesh = self._apply_color_to_mesh(mesh, avg_color / 255.0)
-            
-            return mesh
-            
-        except Exception as e:
-            print(f"Error applying texture: {e}")
-            return mesh
-    
-    def _apply_color_to_mesh(self, mesh: trimesh.Trimesh, color: List[float]) -> trimesh.Trimesh:
-        """単色をメッシュに適用"""
-        try:
-            # 0-1範囲の色を0-255に変換
-            if np.max(color) <= 1.0:
-                color_255 = [int(c * 255) for c in color]
-            else:
-                color_255 = [int(c) for c in color]
-            
-            # 全頂点に同じ色を適用
-            vertex_colors = np.full((len(mesh.vertices), 4), [color_255[0], color_255[1], color_255[2], 255])
-            mesh.visual.vertex_colors = vertex_colors
-            
-            print(f"Applied color {color_255} to {len(mesh.vertices)} vertices")
-            return mesh
-            
-        except Exception as e:
-            print(f"Error applying color: {e}")
-            return mesh
-    
-    def _load_gltf_with_textures(self, gltf_path: str) -> Optional[trimesh.Trimesh]:
-        """GLTF/GLBファイルをテクスチャ付きで読み込む"""
-        print(f"Loading GLTF with textures: {gltf_path}")
-        
-        try:
-            mesh = trimesh.load(gltf_path)
-            
-            if isinstance(mesh, trimesh.Scene):
-                mesh = mesh.dump(concatenate=True)
-            
-            # GLTF内にテクスチャ情報があるかチェック
-            if hasattr(mesh.visual, 'material') and mesh.visual.material is not None:
-                material = mesh.visual.material
-                
-                # BaseColorTextureがある場合
-                if hasattr(material, 'baseColorTexture') and material.baseColorTexture is not None:
-                    print("GLTF has embedded texture information")
-                    return mesh
-                
-                # Imageリソースを探す
-                if hasattr(material, 'image') and material.image is not None:
-                    print("GLTF has image resource")
-                    return mesh
-            
-            # 外部テクスチャファイルを探す
-            gltf_path = Path(gltf_path)
-            for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tga']:
-                texture_path = gltf_path.with_suffix(ext)
-                if texture_path.exists():
-                    print(f"Found external texture: {texture_path}")
-                    mesh = self._apply_texture_to_mesh(mesh, texture_path)
-                    break
-            
-            return mesh
-            
-        except Exception as e:
-            print(f"Error loading GLTF: {e}")
-            return trimesh.load(gltf_path)
-    
-    def _load_dae_with_textures(self, dae_path: str) -> Optional[trimesh.Trimesh]:
-        """DAE (Collada) ファイルをテクスチャ付きで読み込む"""
-        print(f"Loading DAE with textures: {dae_path}")
-        
-        try:
-            mesh = trimesh.load(dae_path)
-            
-            if isinstance(mesh, trimesh.Scene):
-                mesh = mesh.dump(concatenate=True)
-            
-            # DAEファイル内のテクスチャ参照を解析
-            dae_path = Path(dae_path)
-            
-            try:
-                import xml.etree.ElementTree as ET
-                tree = ET.parse(dae_path)
-                root = tree.getroot()
-                
-                # Colladaの名前空間を考慮
-                namespaces = {'': 'http://www.collada.org/2005/11/COLLADASchema'}
-                
-                # library_imagesからテクスチャファイルを探す
-                for image in root.findall('.//image', namespaces):
-                    init_from = image.find('init_from', namespaces)
-                    if init_from is not None:
-                        texture_file = init_from.text
-                        if texture_file:
-                            # 相対パスを絶対パスに変換
-                            texture_path = dae_path.parent / texture_file
-                            if texture_path.exists():
-                                print(f"Found DAE texture: {texture_path}")
-                                mesh = self._apply_texture_to_mesh(mesh, texture_path)
-                                break
-                            
-                            # ファイル名のみの場合、同じディレクトリを探す
-                            texture_name = Path(texture_file).name
-                            texture_path = dae_path.parent / texture_name
-                            if texture_path.exists():
-                                print(f"Found DAE texture: {texture_path}")
-                                mesh = self._apply_texture_to_mesh(mesh, texture_path)
-                                break
-                                
-            except Exception as xml_error:
-                print(f"DAE XML parsing failed: {xml_error}")
-                # フォールバック: 同名ファイルを探す
-                mesh = self._try_find_generic_textures(mesh, dae_path)
-            
-            return mesh
-            
-        except Exception as e:
-            print(f"Error loading DAE: {e}")
-            return trimesh.load(dae_path)
-    
-    def _load_ply_with_textures(self, ply_path: str) -> Optional[trimesh.Trimesh]:
-        """PLYファイルをテクスチャ付きで読み込む"""
-        print(f"Loading PLY with textures: {ply_path}")
-        
-        try:
-            mesh = trimesh.load(ply_path)
-            
-            if isinstance(mesh, trimesh.Scene):
-                mesh = mesh.dump(concatenate=True)
-            
-            # PLYは通常テクスチャ参照を持たないので、同名ファイルを探す
-            mesh = self._try_find_generic_textures(mesh, ply_path)
-            
-            return mesh
-            
-        except Exception as e:
-            print(f"Error loading PLY: {e}")
-            return trimesh.load(ply_path)
-    
-    def _load_3mf_with_textures(self, mf3_path: str) -> Optional[trimesh.Trimesh]:
-        """3MFファイルをテクスチャ付きで読み込む"""
-        print(f"Loading 3MF with textures: {mf3_path}")
-        
-        try:
-            mesh = trimesh.load(mf3_path)
-            
-            if isinstance(mesh, trimesh.Scene):
-                mesh = mesh.dump(concatenate=True)
-            
-            # 3MFはZIPアーカイブなので内部のテクスチャを探す
-            try:
-                import zipfile
-                
-                with zipfile.ZipFile(mf3_path, 'r') as zip_file:
-                    # テクスチャファイルを探す
-                    for file_name in zip_file.namelist():
-                        if file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
-                            print(f"Found 3MF texture: {file_name}")
-                            
-                            # 一時ファイルとして抽出
-                            import tempfile
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_name).suffix) as temp_file:
-                                temp_file.write(zip_file.read(file_name))
-                                temp_path = Path(temp_file.name)
-                            
-                            try:
-                                mesh = self._apply_texture_to_mesh(mesh, temp_path)
-                            finally:
-                                # 一時ファイルを削除
-                                temp_path.unlink(missing_ok=True)
-                            break
-                            
-            except Exception as zip_error:
-                print(f"3MF texture extraction failed: {zip_error}")
-                # フォールバック: 同名ファイルを探す
-                mesh = self._try_find_generic_textures(mesh, mf3_path)
-            
-            return mesh
-            
-        except Exception as e:
-            print(f"Error loading 3MF: {e}")
-            return trimesh.load(mf3_path)
-    
-    def _try_find_generic_textures(self, mesh: trimesh.Trimesh, model_path: str) -> trimesh.Trimesh:
-        """一般的な命名規則でテクスチャファイルを探す"""
-        if mesh is None:
-            return mesh
-            
-        model_path = Path(model_path)
-        model_name = model_path.stem
-        
-        # 一般的なテクスチャファイル名のパターン
-        texture_patterns = [
-            # 同名ファイル
-            f"{model_name}.jpg", f"{model_name}.jpeg", f"{model_name}.png", f"{model_name}.bmp",
-            # diffuse/albedo
-            f"{model_name}_diffuse.jpg", f"{model_name}_diffuse.png",
-            f"{model_name}_albedo.jpg", f"{model_name}_albedo.png",
-            f"{model_name}_color.jpg", f"{model_name}_color.png",
-            # base color
-            f"{model_name}_basecolor.jpg", f"{model_name}_basecolor.png",
-            f"{model_name}_base.jpg", f"{model_name}_base.png",
-            # texture
-            f"{model_name}_texture.jpg", f"{model_name}_texture.png",
-            f"{model_name}_tex.jpg", f"{model_name}_tex.png",
-            # 単純な名前
-            "diffuse.jpg", "diffuse.png", "albedo.jpg", "albedo.png",
-            "texture.jpg", "texture.png", "color.jpg", "color.png"
-        ]
-        
-        # 同じディレクトリとサブディレクトリを探す
-        search_dirs = [
-            model_path.parent,
-            model_path.parent / "textures",
-            model_path.parent / "images", 
-            model_path.parent / "materials",
-            model_path.parent / model_name  # 同名ディレクトリ
-        ]
-        
-        for search_dir in search_dirs:
-            if not search_dir.exists():
-                continue
-                
-            for pattern in texture_patterns:
-                texture_path = search_dir / pattern
-                if texture_path.exists():
-                    print(f"Found generic texture: {texture_path}")
-                    try:
-                        return self._apply_texture_to_mesh(mesh, texture_path)
-                    except Exception as e:
-                        print(f"Failed to apply texture {texture_path}: {e}")
-                        continue
-        
-        print("No external textures found")
-        return mesh
     
     def extract_pointcloud(self, mesh: trimesh.Trimesh, num_points: int = 5000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """メッシュから点群と色情報を抽出（改善版）"""
@@ -684,40 +141,7 @@ class Model3DVideoCreator:
                 return existing_color
         
         # 色情報がないか単調な場合、位置ベースで色を生成
-        return self.generate_position_based_color(point_position, mesh.bounds)
-    
-    def generate_position_based_color(self, position: np.ndarray, bounds: np.ndarray) -> List[int]:
-        """位置に基づいて自然な色を生成（形状理解を助ける）"""
-        # 正規化された位置（0-1の範囲）
-        min_bounds = bounds[0]
-        max_bounds = bounds[1]
-        ranges = max_bounds - min_bounds
-        
-        # ゼロ除算を防ぐ
-        ranges = np.where(ranges == 0, 1.0, ranges)
-        
-        # 位置を0-1に正規化
-        normalized_pos = (position - min_bounds) / ranges
-        normalized_pos = np.clip(normalized_pos, 0, 1)
-        
-        # より自然で一貫性のある色マッピング
-        import colorsys
-        
-        # 高度（Z座標）に基づく色相（青→緑→黄→赤）
-        hue = (1.0 - normalized_pos[2]) * 0.6  # 0.6 = 青から赤までの範囲
-        
-        # 中心からの距離に基づく彩度
-        center_distance = np.sqrt((normalized_pos[0] - 0.5)**2 + (normalized_pos[1] - 0.5)**2)
-        saturation = 0.4 + 0.6 * min(center_distance * 2, 1.0)  # 中心付近は淡く、外側は鮮やか
-        
-        # 明度は比較的均一に（視認性を保つ）
-        value = 0.7 + 0.3 * normalized_pos[1]  # Y座標で少し変化
-        
-        # HSVからRGBに変換
-        rgb = colorsys.hsv_to_rgb(hue, saturation, value)
-        
-        # 0-255の範囲に変換
-        return [int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)]
+        return self.color_generator.generate_position_based_color(point_position, mesh.bounds)
     
     def create_scale_reference(self, mesh_bounds: np.ndarray) -> Dict:
         """スケールリファレンスを作成"""
@@ -972,18 +396,6 @@ class Model3DVideoCreator:
         
         return frames
     
-    def apply_depth_shading(self, color: List[int], depth: float, max_depth: float) -> List[int]:
-        """深度に基づいて色調を調整"""
-        if not self.use_depth_shading or max_depth == 0:
-            return color
-            
-        # 深度を0-1に正規化
-        depth_ratio = min(depth / max_depth, 1.0)
-        # より遠い点ほど暗くする
-        shading_factor = 0.3 + 0.7 * (1.0 - depth_ratio)
-        
-        return [int(c * shading_factor) for c in color]
-    
     def _render_wireframe(self, mesh: trimesh.Trimesh, center: np.ndarray, 
                          camera_pos: np.ndarray, view_vector: np.ndarray,
                          right_vector: np.ndarray, up_vector: np.ndarray,
@@ -1025,7 +437,7 @@ class Model3DVideoCreator:
                     # エッジの中点での深度を計算
                     mid_vertex = (start_vertex + end_vertex) / 2
                     depth = np.linalg.norm(mid_vertex - camera_pos)
-                    line_color = self.apply_depth_shading([80, 80, 80], depth, max_depth)
+                    line_color = self.color_generator.apply_depth_shading([80, 80, 80], depth, max_depth)
                     self._draw_line(img, start_2d, end_2d, line_color)
         
         return img
@@ -1165,7 +577,7 @@ class Model3DVideoCreator:
                 
                 # 深度シェーディングを適用
                 depth = depths[i] if i < len(depths) else max_depth
-                point_color = self.apply_depth_shading(base_color, depth, max_depth)
+                point_color = self.color_generator.apply_depth_shading(base_color, depth, max_depth)
                 
                 # 見える点のみ描画（より大きなサイズで）
                 if visible and 0 <= pixel_x < image_size[0] and 0 <= pixel_y < image_size[1]:

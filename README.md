@@ -1,6 +1,6 @@
 # 3D Model Understanding Tools
 
-3Dモデルを解析してLLMが理解しやすい形式に変換するPythonツール集です。
+3DモデルをGemini AI分析用の高品質動画に変換するPythonツール集です。
 
 ## 機能
 
@@ -8,8 +8,19 @@
 - X, Y, Z軸すべての回転解析を含む統合動画を生成
 - ワイヤーフレーム、点群、断面図を同時表示
 - 背面カリング、グラデーション断面表示
-- 高品質MP4出力
-- 対応形式: PLY, OBJ, STL, OFF, GLB, GLTF, DAE, 3MF
+- テクスチャ・マテリアル対応（OBJ+MTL, GLTF, DAE等）
+- 幾何学的断面解析（正確な円形断面）
+- スケールリファレンス表示
+- ズーム詳細表示
+- 高品質MP4出力（720p, 1080p, 4K）
+- 対応形式: PLY, OBJ, STL, OFF, GLB, GLTF, DAE, 3MF, X3D
+
+### モジュール構成
+- `create_rotation_video.py` - メインの動画作成クラス
+- `texture_loader.py` - テクスチャ読み込み（OBJ+MTL, GLTF, DAE, PLY, 3MF対応）
+- `x3d_loader.py` - X3Dファイル読み込み
+- `color_generator.py` - 色生成・シェーディング
+- `cross_section_processor.py` - 断面処理
 
 ### 2. AI動画解析ツール (`gemini_video_analyze.py`)
 - 生成された3D回転動画をGoogle Gemini AIで解析
@@ -42,11 +53,11 @@ python create_rotation_video.py path/to/your/model.ply
 # フレーム数とFPSを調整
 python create_rotation_video.py model.ply --frames 60 --fps 30
 
-# 断面図なし
-python create_rotation_video.py model.ply --no-cross-sections
+# 高解像度・フレーム数指定
+python create_rotation_video.py model.obj --resolution 4k --frames 120 --fps 60
 
-# 個別動画も作成
-python create_rotation_video.py model.ply --individual
+# 断面図なしで個別動画作成
+python create_rotation_video.py model.obj --no-cross-sections --individual
 ```
 
 ### 2. AI動画解析の実行
@@ -98,23 +109,57 @@ Output/video_output_YYYYMMDD_HHMMSS/
 
 ## 対応3Dファイル形式
 
+### 3Dモデル
+- OBJ (.obj) + MTL テクスチャ
 - PLY (.ply)
-- OBJ (.obj)
 - STL (.stl)
-- OFF (.off)
-- GLB (.glb)
-- GLTF (.gltf)
-- DAE (.dae)
+- GLTF/GLB (.gltf/.glb)  
+- DAE (.dae) - Collada
 - 3MF (.3mf)
+- X3D (.x3d)
+- OFF (.off)
+
+### テクスチャ
+- JPG, PNG, BMP
+- MTL材質定義
+- GLTF埋め込みテクスチャ
+- DAE XMLテクスチャ参照
 
 ## 技術的特徴
 
+### 幾何学的断面
+- mesh.section()による真の平面交線計算
+- 球体断面の正確な円形表示
+- サイズ変化の正確な表現
+
+### テクスチャマッピング
+- UV座標による正確なテクスチャマッピング
+- 外部ファイル参照の自動検出
+- フォールバック色生成
+
+### 色生成
+- 位置ベースHSVカラーマッピング
+- 深度シェーディング
+- グラデーション色生成
+
+### その他の特徴
 - **Trimesh** - 高速で安定した3D処理
 - **背面カリング** - カメラから見える面のみ表示
 - **特徴点抽出** - 境界検出、曲率解析、距離ベース選択
 - **透視投影** - 自然な3D表示
-- **断面解析** - グラデーション色分け、輪郭線表示
 - **MP4出力** - OpenCVによる高品質動画生成
+
+## 使用例
+
+### 猫モデル（テクスチャ付き）
+```bash
+python create_rotation_video.py "sample.obj"
+```
+
+### 球体モデル（断面解析）
+```bash
+python create_rotation_video.py sampple.x3d --resolution 1080p
+```
 
 ## トラブルシューティング
 
@@ -148,7 +193,11 @@ export GOOGLE_API_KEY="your-api-key-here"
 
 ### 主要ファイル
 
-- `create_rotation_video.py` - 3D回転動画生成
+- `create_rotation_video.py` - メインの動画作成クラス
+- `texture_loader.py` - テクスチャ読み込みモジュール
+- `x3d_loader.py` - X3Dファイル読み込みモジュール
+- `color_generator.py` - 色生成・シェーディングモジュール
+- `cross_section_processor.py` - 断面処理モジュール
 - `gemini_video_analyze.py` - AI動画解析
 
 ### カスタマイズ可能な設定
