@@ -10,15 +10,19 @@ import cv2
 from PIL import Image, ImageDraw, ImageFont
 
 class Model3DVideoCreator:
-    """3Dモデルの回転動画作成クラス"""
+    """3Dモデルの回転動画作成クラス - Gemini分析用に最適化"""
     
-    def __init__(self, output_dir: str = None):
+    def __init__(self, output_dir: str = None, scale_reference_size: float = None):
         if output_dir is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = f"Output/video_output_{timestamp}"
         
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # スケールリファレンス設定
+        self.scale_reference_size = scale_reference_size  # ユニット単位のサイズ
+        self.default_reference_ratio = 0.1  # モデルサイズに対する比率
         
         # サポートする3Dモデルの拡張子
         self.supported_formats = [
@@ -29,6 +33,13 @@ class Model3DVideoCreator:
             # その他
             '.xyz', '.dxf', '.svg'
         ]
+        
+        
+        # 視覚化パラメータ
+        self.enhanced_lighting = True
+        self.use_depth_shading = True
+        self.background_color = [248, 248, 248]  # 高コントラスト背景
+    
         
     def load_model(self, model_path: str) -> Optional[trimesh.Trimesh]:
         """3Dモデルを読み込む"""
@@ -44,8 +55,13 @@ class Model3DVideoCreator:
             return None
             
         try:
+            # X3D形式の特別な処理
+            if model_path.suffix.lower() == '.x3d':
+                mesh = self._load_x3d_file(str(model_path))
+                if mesh is None:
+                    return None
             # CAD形式の特別な処理
-            if model_path.suffix.lower() in ['.step', '.stp', '.iges', '.igs']:
+            elif model_path.suffix.lower() in ['.step', '.stp', '.iges', '.igs']:
                 try:
                     # CAD形式の読み込みを試行
                     mesh = trimesh.load(str(model_path))
@@ -55,7 +71,21 @@ class Model3DVideoCreator:
                     print("Note: CAD formats may require additional libraries (FreeCAD, opencascade)")
                     return None
             else:
-                mesh = trimesh.load(str(model_path))
+                # テクスチャを持つフォーマットの特別処理
+                if model_path.suffix.lower() == '.obj':
+                    mesh = self._load_obj_with_textures(str(model_path))
+                elif model_path.suffix.lower() in ['.gltf', '.glb']:
+                    mesh = self._load_gltf_with_textures(str(model_path))
+                elif model_path.suffix.lower() == '.dae':
+                    mesh = self._load_dae_with_textures(str(model_path))
+                elif model_path.suffix.lower() == '.ply':
+                    mesh = self._load_ply_with_textures(str(model_path))
+                elif model_path.suffix.lower() == '.3mf':
+                    mesh = self._load_3mf_with_textures(str(model_path))
+                else:
+                    mesh = trimesh.load(str(model_path))
+                    # 一般的なテクスチャファイルを探す
+                    mesh = self._try_find_generic_textures(mesh, str(model_path))
             
             if isinstance(mesh, trimesh.Scene):
                 mesh = mesh.dump(concatenate=True)
@@ -73,25 +103,698 @@ class Model3DVideoCreator:
                 print("Tip: Try converting CAD files to STL or OBJ format for better compatibility")
             return None
     
+    def _load_x3d_file(self, file_path: str) -> Optional[trimesh.Trimesh]:
+        """X3Dファイルを読み込む"""
+        print(f"Attempting to load X3D file: {file_path}")
+        
+        try:
+            import xml.etree.ElementTree as ET
+            
+            # X3Dファイルをパース
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            
+            vertices = []
+            faces = []
+            
+            # IndexedFaceSetを探す
+            for indexed_face_set in root.iter():
+                if 'IndexedFaceSet' in indexed_face_set.tag:
+                    # Coordinateノードを探す
+                    coordinate_node = None
+                    for child in indexed_face_set:
+                        if 'Coordinate' in child.tag:
+                            coordinate_node = child
+                            break
+                    
+                    if coordinate_node is not None and 'point' in coordinate_node.attrib:
+                        # 頂点座標を抽出
+                        points_str = coordinate_node.attrib['point']
+                        point_values = [float(x) for x in points_str.replace(',', ' ').split()]
+                        
+                        # 3つずつグループ化してx,y,z座標にする
+                        for i in range(0, len(point_values), 3):
+                            if i + 2 < len(point_values):
+                                vertices.append([point_values[i], point_values[i+1], point_values[i+2]])
+                    
+                    # 面のインデックスを抽出
+                    if 'coordIndex' in indexed_face_set.attrib:
+                        indices_str = indexed_face_set.attrib['coordIndex']
+                        indices = [int(x) for x in indices_str.replace(',', ' ').split() if x.strip() and x.strip() != '-1']
+                        
+                        # 3つずつグループ化して三角形の面にする
+                        for i in range(0, len(indices), 3):
+                            if i + 2 < len(indices):
+                                faces.append([indices[i], indices[i+1], indices[i+2]])
+            
+            # Shape > Geometry > IndexedFaceSetのパターンも確認
+            for shape in root.iter():
+                if 'Shape' in shape.tag:
+                    for geometry in shape:
+                        if 'Geometry' in geometry.tag or 'IndexedFaceSet' in geometry.tag:
+                            self._extract_x3d_geometry(geometry, vertices, faces)
+            
+            if vertices and faces:
+                vertices = np.array(vertices)
+                faces = np.array(faces)
+                
+                # 無効な面インデックスを除去
+                valid_faces = []
+                for face in faces:
+                    if all(0 <= idx < len(vertices) for idx in face):
+                        valid_faces.append(face)
+                
+                if valid_faces:
+                    faces = np.array(valid_faces)
+                    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+                    print(f"✓ X3D converted to mesh: {len(vertices)} vertices, {len(faces)} faces")
+                    return mesh
+                else:
+                    print("⚠️  No valid faces found in X3D file")
+            else:
+                print("⚠️  No geometry found in X3D file")
+                
+        except Exception as e:
+            print(f"⚠️  Failed to load X3D file: {e}")
+            
+        return None
+    
+    def _extract_x3d_geometry(self, geometry_node, vertices, faces):
+        """X3Dジオメトリノードから頂点と面を抽出"""
+        try:
+            # 直接的なIndexedFaceSet
+            if 'IndexedFaceSet' in geometry_node.tag:
+                self._process_x3d_indexed_face_set(geometry_node, vertices, faces)
+            
+            # 子ノードをチェック
+            for child in geometry_node:
+                if 'IndexedFaceSet' in child.tag:
+                    self._process_x3d_indexed_face_set(child, vertices, faces)
+                elif 'Coordinate' in child.tag and 'point' in child.attrib:
+                    # 独立したCoordinateノードの処理
+                    pass  # IndexedFaceSetと組み合わせて処理される
+                    
+        except Exception as e:
+            print(f"Warning: Error processing X3D geometry node: {e}")
+    
+    def _process_x3d_indexed_face_set(self, face_set_node, vertices, faces):
+        """IndexedFaceSetノードを処理"""
+        try:
+            coordinate_node = None
+            
+            # Coordinateノードを探す
+            for child in face_set_node:
+                if 'Coordinate' in child.tag:
+                    coordinate_node = child
+                    break
+            
+            # 頂点座標を抽出
+            if coordinate_node is not None and 'point' in coordinate_node.attrib:
+                points_str = coordinate_node.attrib['point']
+                point_values = [float(x) for x in points_str.replace(',', ' ').split()]
+                
+                vertex_start_idx = len(vertices)
+                
+                # 3つずつグループ化
+                for i in range(0, len(point_values), 3):
+                    if i + 2 < len(point_values):
+                        vertices.append([point_values[i], point_values[i+1], point_values[i+2]])
+                
+                # 面のインデックスを抽出
+                if 'coordIndex' in face_set_node.attrib:
+                    indices_str = face_set_node.attrib['coordIndex']
+                    # -1で区切られた面のインデックス
+                    face_groups = indices_str.replace(',', ' ').split('-1')
+                    
+                    for face_group in face_groups:
+                        indices = [int(x) for x in face_group.split() if x.strip()]
+                        
+                        if len(indices) >= 3:
+                            # 三角形に分割（ファン三角分割）
+                            for i in range(1, len(indices) - 1):
+                                face = [
+                                    vertex_start_idx + indices[0],
+                                    vertex_start_idx + indices[i],
+                                    vertex_start_idx + indices[i + 1]
+                                ]
+                                faces.append(face)
+                                
+        except Exception as e:
+            print(f"Warning: Error processing IndexedFaceSet: {e}")
+    
+    def _load_obj_with_textures(self, obj_path: str) -> Optional[trimesh.Trimesh]:
+        """OBJファイルをテクスチャ付きで読み込む"""
+        print(f"Loading OBJ with textures: {obj_path}")
+        
+        try:
+            # まず通常の方法で読み込み
+            mesh = trimesh.load(obj_path)
+            
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+            
+            # MTLファイルを探す
+            obj_path = Path(obj_path)
+            mtl_path = obj_path.with_suffix('.mtl')
+            
+            # 同じディレクトリでMTLファイルを探す
+            if not mtl_path.exists():
+                # 同じ名前のディレクトリ内を探す
+                dir_path = obj_path.parent / obj_path.stem
+                if dir_path.exists():
+                    for mtl_file in dir_path.glob("*.mtl"):
+                        mtl_path = mtl_file
+                        break
+                
+                # 親ディレクトリ内も探す
+                if not mtl_path.exists():
+                    for mtl_file in obj_path.parent.glob("*.mtl"):
+                        mtl_path = mtl_file
+                        break
+            
+            if mtl_path.exists():
+                print(f"Found MTL file: {mtl_path}")
+                # MTLファイルを解析してテクスチャを適用
+                mesh = self._apply_mtl_textures(mesh, mtl_path)
+            else:
+                print("No MTL file found")
+            
+            return mesh
+            
+        except Exception as e:
+            print(f"Error loading OBJ with textures: {e}")
+            # フォールバック: 通常の読み込み
+            try:
+                return trimesh.load(obj_path)
+            except:
+                return None
+    
+    def _apply_mtl_textures(self, mesh: trimesh.Trimesh, mtl_path: Path) -> trimesh.Trimesh:
+        """MTLファイルからテクスチャ情報を適用"""
+        try:
+            print(f"Parsing MTL file: {mtl_path}")
+            
+            # MTLファイルを解析
+            materials = self._parse_mtl_file(mtl_path)
+            
+            if materials:
+                print(f"Found {len(materials)} materials in MTL")
+                
+                # 最初のマテリアルを使用（複数マテリアルの場合は後で改善可能）
+                material_name = list(materials.keys())[0]
+                material = materials[material_name]
+                
+                print(f"Using material: {material_name}")
+                
+                # 拡散反射テクスチャを適用
+                if 'map_Kd' in material:
+                    texture_path = mtl_path.parent / material['map_Kd']
+                    if texture_path.exists():
+                        print(f"Loading texture: {texture_path}")
+                        mesh = self._apply_texture_to_mesh(mesh, texture_path)
+                    else:
+                        print(f"Texture file not found: {texture_path}")
+                
+                # 拡散反射色を適用
+                elif 'Kd' in material:
+                    color = material['Kd']
+                    print(f"Applying diffuse color: {color}")
+                    mesh = self._apply_color_to_mesh(mesh, color)
+            
+            return mesh
+            
+        except Exception as e:
+            print(f"Error applying MTL textures: {e}")
+            return mesh
+    
+    def _parse_mtl_file(self, mtl_path: Path) -> Dict:
+        """MTLファイルを解析"""
+        materials = {}
+        current_material = None
+        
+        try:
+            with open(mtl_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    
+                    command = parts[0]
+                    
+                    if command == 'newmtl':
+                        current_material = parts[1]
+                        materials[current_material] = {}
+                    
+                    elif current_material and command in ['Kd', 'Ka', 'Ks']:
+                        # 拡散反射色、環境反射色、鏡面反射色
+                        if len(parts) >= 4:
+                            materials[current_material][command] = [
+                                float(parts[1]), float(parts[2]), float(parts[3])
+                            ]
+                    
+                    elif current_material and command == 'map_Kd':
+                        # 拡散反射テクスチャ
+                        materials[current_material][command] = parts[1]
+                    
+                    elif current_material and command in ['map_Ka', 'map_Ks', 'map_Bump', 'bump']:
+                        # その他のテクスチャマップ
+                        materials[current_material][command] = parts[1]
+        
+        except Exception as e:
+            print(f"Error parsing MTL file: {e}")
+        
+        return materials
+    
+    def _apply_texture_to_mesh(self, mesh: trimesh.Trimesh, texture_path: Path) -> trimesh.Trimesh:
+        """テクスチャ画像をメッシュに適用"""
+        try:
+            from PIL import Image
+            import numpy as np
+            
+            # テクスチャ画像を読み込み
+            texture_image = Image.open(texture_path).convert('RGB')
+            texture_array = np.array(texture_image)
+            
+            print(f"Texture loaded: {texture_array.shape}")
+            
+            # メッシュがUVマッピングを持っている場合
+            if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
+                # UV座標を使って頂点色を計算
+                uv_coords = mesh.visual.uv
+                vertex_colors = []
+                
+                h, w = texture_array.shape[:2]
+                
+                for uv in uv_coords:
+                    # UV座標をテクスチャのピクセル座標に変換
+                    u, v = uv[0], 1.0 - uv[1]  # Vを反転
+                    x = int(np.clip(u * (w - 1), 0, w - 1))
+                    y = int(np.clip(v * (h - 1), 0, h - 1))
+                    
+                    # テクスチャから色を取得
+                    color = texture_array[y, x]
+                    vertex_colors.append([color[0], color[1], color[2], 255])
+                
+                vertex_colors = np.array(vertex_colors)
+                
+                # メッシュに頂点色を設定
+                mesh.visual.vertex_colors = vertex_colors
+                print(f"Applied texture colors to {len(vertex_colors)} vertices")
+            
+            else:
+                print("No UV mapping found, applying average texture color")
+                # UV座標がない場合は平均色を使用
+                avg_color = np.mean(texture_array.reshape(-1, 3), axis=0)
+                mesh = self._apply_color_to_mesh(mesh, avg_color / 255.0)
+            
+            return mesh
+            
+        except Exception as e:
+            print(f"Error applying texture: {e}")
+            return mesh
+    
+    def _apply_color_to_mesh(self, mesh: trimesh.Trimesh, color: List[float]) -> trimesh.Trimesh:
+        """単色をメッシュに適用"""
+        try:
+            # 0-1範囲の色を0-255に変換
+            if np.max(color) <= 1.0:
+                color_255 = [int(c * 255) for c in color]
+            else:
+                color_255 = [int(c) for c in color]
+            
+            # 全頂点に同じ色を適用
+            vertex_colors = np.full((len(mesh.vertices), 4), [color_255[0], color_255[1], color_255[2], 255])
+            mesh.visual.vertex_colors = vertex_colors
+            
+            print(f"Applied color {color_255} to {len(mesh.vertices)} vertices")
+            return mesh
+            
+        except Exception as e:
+            print(f"Error applying color: {e}")
+            return mesh
+    
+    def _load_gltf_with_textures(self, gltf_path: str) -> Optional[trimesh.Trimesh]:
+        """GLTF/GLBファイルをテクスチャ付きで読み込む"""
+        print(f"Loading GLTF with textures: {gltf_path}")
+        
+        try:
+            mesh = trimesh.load(gltf_path)
+            
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+            
+            # GLTF内にテクスチャ情報があるかチェック
+            if hasattr(mesh.visual, 'material') and mesh.visual.material is not None:
+                material = mesh.visual.material
+                
+                # BaseColorTextureがある場合
+                if hasattr(material, 'baseColorTexture') and material.baseColorTexture is not None:
+                    print("GLTF has embedded texture information")
+                    return mesh
+                
+                # Imageリソースを探す
+                if hasattr(material, 'image') and material.image is not None:
+                    print("GLTF has image resource")
+                    return mesh
+            
+            # 外部テクスチャファイルを探す
+            gltf_path = Path(gltf_path)
+            for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tga']:
+                texture_path = gltf_path.with_suffix(ext)
+                if texture_path.exists():
+                    print(f"Found external texture: {texture_path}")
+                    mesh = self._apply_texture_to_mesh(mesh, texture_path)
+                    break
+            
+            return mesh
+            
+        except Exception as e:
+            print(f"Error loading GLTF: {e}")
+            return trimesh.load(gltf_path)
+    
+    def _load_dae_with_textures(self, dae_path: str) -> Optional[trimesh.Trimesh]:
+        """DAE (Collada) ファイルをテクスチャ付きで読み込む"""
+        print(f"Loading DAE with textures: {dae_path}")
+        
+        try:
+            mesh = trimesh.load(dae_path)
+            
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+            
+            # DAEファイル内のテクスチャ参照を解析
+            dae_path = Path(dae_path)
+            
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(dae_path)
+                root = tree.getroot()
+                
+                # Colladaの名前空間を考慮
+                namespaces = {'': 'http://www.collada.org/2005/11/COLLADASchema'}
+                
+                # library_imagesからテクスチャファイルを探す
+                for image in root.findall('.//image', namespaces):
+                    init_from = image.find('init_from', namespaces)
+                    if init_from is not None:
+                        texture_file = init_from.text
+                        if texture_file:
+                            # 相対パスを絶対パスに変換
+                            texture_path = dae_path.parent / texture_file
+                            if texture_path.exists():
+                                print(f"Found DAE texture: {texture_path}")
+                                mesh = self._apply_texture_to_mesh(mesh, texture_path)
+                                break
+                            
+                            # ファイル名のみの場合、同じディレクトリを探す
+                            texture_name = Path(texture_file).name
+                            texture_path = dae_path.parent / texture_name
+                            if texture_path.exists():
+                                print(f"Found DAE texture: {texture_path}")
+                                mesh = self._apply_texture_to_mesh(mesh, texture_path)
+                                break
+                                
+            except Exception as xml_error:
+                print(f"DAE XML parsing failed: {xml_error}")
+                # フォールバック: 同名ファイルを探す
+                mesh = self._try_find_generic_textures(mesh, dae_path)
+            
+            return mesh
+            
+        except Exception as e:
+            print(f"Error loading DAE: {e}")
+            return trimesh.load(dae_path)
+    
+    def _load_ply_with_textures(self, ply_path: str) -> Optional[trimesh.Trimesh]:
+        """PLYファイルをテクスチャ付きで読み込む"""
+        print(f"Loading PLY with textures: {ply_path}")
+        
+        try:
+            mesh = trimesh.load(ply_path)
+            
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+            
+            # PLYは通常テクスチャ参照を持たないので、同名ファイルを探す
+            mesh = self._try_find_generic_textures(mesh, ply_path)
+            
+            return mesh
+            
+        except Exception as e:
+            print(f"Error loading PLY: {e}")
+            return trimesh.load(ply_path)
+    
+    def _load_3mf_with_textures(self, mf3_path: str) -> Optional[trimesh.Trimesh]:
+        """3MFファイルをテクスチャ付きで読み込む"""
+        print(f"Loading 3MF with textures: {mf3_path}")
+        
+        try:
+            mesh = trimesh.load(mf3_path)
+            
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.dump(concatenate=True)
+            
+            # 3MFはZIPアーカイブなので内部のテクスチャを探す
+            try:
+                import zipfile
+                
+                with zipfile.ZipFile(mf3_path, 'r') as zip_file:
+                    # テクスチャファイルを探す
+                    for file_name in zip_file.namelist():
+                        if file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                            print(f"Found 3MF texture: {file_name}")
+                            
+                            # 一時ファイルとして抽出
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file_name).suffix) as temp_file:
+                                temp_file.write(zip_file.read(file_name))
+                                temp_path = Path(temp_file.name)
+                            
+                            try:
+                                mesh = self._apply_texture_to_mesh(mesh, temp_path)
+                            finally:
+                                # 一時ファイルを削除
+                                temp_path.unlink(missing_ok=True)
+                            break
+                            
+            except Exception as zip_error:
+                print(f"3MF texture extraction failed: {zip_error}")
+                # フォールバック: 同名ファイルを探す
+                mesh = self._try_find_generic_textures(mesh, mf3_path)
+            
+            return mesh
+            
+        except Exception as e:
+            print(f"Error loading 3MF: {e}")
+            return trimesh.load(mf3_path)
+    
+    def _try_find_generic_textures(self, mesh: trimesh.Trimesh, model_path: str) -> trimesh.Trimesh:
+        """一般的な命名規則でテクスチャファイルを探す"""
+        if mesh is None:
+            return mesh
+            
+        model_path = Path(model_path)
+        model_name = model_path.stem
+        
+        # 一般的なテクスチャファイル名のパターン
+        texture_patterns = [
+            # 同名ファイル
+            f"{model_name}.jpg", f"{model_name}.jpeg", f"{model_name}.png", f"{model_name}.bmp",
+            # diffuse/albedo
+            f"{model_name}_diffuse.jpg", f"{model_name}_diffuse.png",
+            f"{model_name}_albedo.jpg", f"{model_name}_albedo.png",
+            f"{model_name}_color.jpg", f"{model_name}_color.png",
+            # base color
+            f"{model_name}_basecolor.jpg", f"{model_name}_basecolor.png",
+            f"{model_name}_base.jpg", f"{model_name}_base.png",
+            # texture
+            f"{model_name}_texture.jpg", f"{model_name}_texture.png",
+            f"{model_name}_tex.jpg", f"{model_name}_tex.png",
+            # 単純な名前
+            "diffuse.jpg", "diffuse.png", "albedo.jpg", "albedo.png",
+            "texture.jpg", "texture.png", "color.jpg", "color.png"
+        ]
+        
+        # 同じディレクトリとサブディレクトリを探す
+        search_dirs = [
+            model_path.parent,
+            model_path.parent / "textures",
+            model_path.parent / "images", 
+            model_path.parent / "materials",
+            model_path.parent / model_name  # 同名ディレクトリ
+        ]
+        
+        for search_dir in search_dirs:
+            if not search_dir.exists():
+                continue
+                
+            for pattern in texture_patterns:
+                texture_path = search_dir / pattern
+                if texture_path.exists():
+                    print(f"Found generic texture: {texture_path}")
+                    try:
+                        return self._apply_texture_to_mesh(mesh, texture_path)
+                    except Exception as e:
+                        print(f"Failed to apply texture {texture_path}: {e}")
+                        continue
+        
+        print("No external textures found")
+        return mesh
+    
     def extract_pointcloud(self, mesh: trimesh.Trimesh, num_points: int = 5000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """メッシュから点群と色情報を抽出"""
+        """メッシュから点群と色情報を抽出（改善版）"""
         points, face_indices = mesh.sample(num_points, return_index=True)
         normals = mesh.face_normals[face_indices]
         
-        # 各点の色を取得
+        # 色情報を改善して取得
         colors = []
+        
+        # メッシュに視覚情報があるかチェック
+        has_vertex_colors = hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None
+        has_face_colors = hasattr(mesh.visual, 'face_colors') and mesh.visual.face_colors is not None
+        has_material = hasattr(mesh.visual, 'material') and mesh.visual.material is not None
+        
+        print(f"Color info - Vertex colors: {has_vertex_colors}, Face colors: {has_face_colors}, Material: {has_material}")
+        
         for i, face_idx in enumerate(face_indices):
-            color = self.get_point_color(mesh, face_idx, i)
+            color = self.get_enhanced_point_color(mesh, face_idx, points[i])
             colors.append(color)
         
         colors = np.array(colors)
+        
+        # 色の多様性をチェック
+        unique_colors = len(np.unique(colors.reshape(-1, colors.shape[-1]), axis=0))
+        print(f"Generated {unique_colors} unique colors from {len(colors)} points")
+        
         return points, normals, colors
     
+    def get_enhanced_point_color(self, mesh: trimesh.Trimesh, face_index: int, point_position: np.ndarray) -> List[int]:
+        """改善された色取得（位置ベースの色生成も含む）"""
+        # まず既存の色情報を試す
+        existing_color = self.get_point_color(mesh, face_index, None)
+        
+        # デフォルトグレー以外の色が取得できて、かつ興味深い色の場合はそれを使用
+        if existing_color != [150, 150, 150]:
+            # 色の多様性をチェック（すべて同じ値の場合は位置ベース色を使用）
+            if not (existing_color[0] == existing_color[1] == existing_color[2]):
+                return existing_color
+        
+        # 色情報がないか単調な場合、位置ベースで色を生成
+        return self.generate_position_based_color(point_position, mesh.bounds)
+    
+    def generate_position_based_color(self, position: np.ndarray, bounds: np.ndarray) -> List[int]:
+        """位置に基づいて自然な色を生成（形状理解を助ける）"""
+        # 正規化された位置（0-1の範囲）
+        min_bounds = bounds[0]
+        max_bounds = bounds[1]
+        ranges = max_bounds - min_bounds
+        
+        # ゼロ除算を防ぐ
+        ranges = np.where(ranges == 0, 1.0, ranges)
+        
+        # 位置を0-1に正規化
+        normalized_pos = (position - min_bounds) / ranges
+        normalized_pos = np.clip(normalized_pos, 0, 1)
+        
+        # より自然で一貫性のある色マッピング
+        import colorsys
+        
+        # 高度（Z座標）に基づく色相（青→緑→黄→赤）
+        hue = (1.0 - normalized_pos[2]) * 0.6  # 0.6 = 青から赤までの範囲
+        
+        # 中心からの距離に基づく彩度
+        center_distance = np.sqrt((normalized_pos[0] - 0.5)**2 + (normalized_pos[1] - 0.5)**2)
+        saturation = 0.4 + 0.6 * min(center_distance * 2, 1.0)  # 中心付近は淡く、外側は鮮やか
+        
+        # 明度は比較的均一に（視認性を保つ）
+        value = 0.7 + 0.3 * normalized_pos[1]  # Y座標で少し変化
+        
+        # HSVからRGBに変換
+        rgb = colorsys.hsv_to_rgb(hue, saturation, value)
+        
+        # 0-255の範囲に変換
+        return [int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)]
+    
+    def create_scale_reference(self, mesh_bounds: np.ndarray) -> Dict:
+        """スケールリファレンスを作成"""
+        extent = np.max(mesh_bounds[1] - mesh_bounds[0])
+        
+        if self.scale_reference_size is not None:
+            # ユーザー指定のサイズを使用
+            reference_size = self.scale_reference_size
+        else:
+            # モデルサイズの比率から自動計算
+            reference_size = extent * self.default_reference_ratio
+            
+        # 適切な単位を選択
+        if reference_size >= 1.0:
+            unit = "unit"
+            display_size = reference_size
+        elif reference_size >= 0.01:
+            unit = "cm"
+            display_size = reference_size * 100
+        else:
+            unit = "mm"
+            display_size = reference_size * 1000
+            
+        return {
+            'size': reference_size,
+            'display_size': display_size,
+            'unit': unit,
+            'extent_ratio': reference_size / extent
+        }
+    
+    def add_scale_reference_to_image(self, img: np.ndarray, scale_info: Dict, 
+                                   position: str = "bottom_right") -> np.ndarray:
+        """画像にスケールリファレンスを追加"""
+        from PIL import Image, ImageDraw, ImageFont
+        
+        img_uint8 = img.astype(np.uint8)
+        pil_img = Image.fromarray(img_uint8)
+        draw = ImageDraw.Draw(pil_img)
+        
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", 12)
+        except:
+            font = ImageFont.load_default()
+            
+        # スケールバーのサイズ（ピクセル）
+        bar_length = 50  # 固定長
+        bar_height = 3
+        
+        # 位置を計算
+        margin = 15
+        if position == "bottom_right":
+            x = img.shape[1] - bar_length - margin
+            y = img.shape[0] - 30 - margin
+        elif position == "bottom_left":
+            x = margin
+            y = img.shape[0] - 30 - margin
+        else:  # top_right
+            x = img.shape[1] - bar_length - margin
+            y = margin + 20
+            
+        # スケールバーを描画
+        draw.rectangle([x, y, x + bar_length, y + bar_height], 
+                      fill=(0, 0, 0), outline=(0, 0, 0))
+        
+        # テキストを描画
+        text = f"{scale_info['display_size']:.1f} {scale_info['unit']}"
+        draw.text((x + bar_length // 2, y + bar_height + 2), text, 
+                 fill=(0, 0, 0), font=font, anchor="ma")
+        
+        return np.array(pil_img)
+    
     def add_text_to_image(self, img: np.ndarray, projection_type: str, view_name: str, 
-                         frame_number: int = None) -> np.ndarray:
+                         frame_number: int = None, scale_info: Dict = None) -> np.ndarray:
         """画像にテキストを追加"""
-        # NumPy配列をPIL Imageに変換
-        pil_img = Image.fromarray(img)
+        # NumPy配列をPIL Imageに変換（データ型を修正）
+        img_uint8 = img.astype(np.uint8)
+        pil_img = Image.fromarray(img_uint8)
         draw = ImageDraw.Draw(pil_img)
         
         try:
@@ -115,13 +818,19 @@ class Model3DVideoCreator:
             draw.text((10, y_offset), line, fill=(0, 0, 0), font=font)
             y_offset += 25
         
-        # PIL ImageをNumPy配列に戻す
-        return np.array(pil_img)
+        # PIL ImageをNumPy配列に戻してスケールリファレンスを追加
+        img_with_text = np.array(pil_img)
+        
+        if scale_info is not None:
+            img_with_text = self.add_scale_reference_to_image(img_with_text, scale_info)
+        
+        return img_with_text
     
     def create_wireframe_rotation_frames(self, mesh: trimesh.Trimesh, 
                                        num_frames: int = 60,
                                        image_size: Tuple[int, int] = (800, 600),
-                                       rotation_axis: str = 'y') -> List[np.ndarray]:
+                                       rotation_axis: str = 'y',
+                                       with_scale: bool = True) -> List[np.ndarray]:
         """ワイヤーフレームの回転フレームを作成"""
         frames = []
         
@@ -130,6 +839,9 @@ class Model3DVideoCreator:
         center = mesh.centroid
         extent = np.max(bounds[1] - bounds[0])
         distance = extent * 2.5
+        
+        # スケールリファレンス情報を作成
+        scale_info = self.create_scale_reference(bounds) if with_scale else None
         
         for frame in range(num_frames):
             # 回転角度を計算（360度を num_frames で分割）
@@ -186,8 +898,8 @@ class Model3DVideoCreator:
             img = self._render_wireframe(mesh, center, camera_pos, view_vector, 
                                        right_vector, up_vector, image_size)
             
-            # テキストを追加
-            img = self.add_text_to_image(img, "Perspective", f"Rotation {rotation_axis.upper()}", frame)
+            # テキストとスケールを追加
+            img = self.add_text_to_image(img, "Wireframe", f"Rotation {rotation_axis.upper()}", frame, scale_info)
             frames.append(img)
         
         return frames
@@ -195,7 +907,8 @@ class Model3DVideoCreator:
     def create_pointcloud_rotation_frames(self, points: np.ndarray, normals: np.ndarray, colors: np.ndarray,
                                         num_frames: int = 60,
                                         image_size: Tuple[int, int] = (800, 600),
-                                        rotation_axis: str = 'y') -> List[np.ndarray]:
+                                        rotation_axis: str = 'y',
+                                        with_scale: bool = True) -> List[np.ndarray]:
         """点群の回転フレームを作成"""
         frames = []
         
@@ -203,6 +916,10 @@ class Model3DVideoCreator:
         center = points.mean(axis=0)
         extent = np.max(points.max(axis=0) - points.min(axis=0))
         distance = extent * 3.0  # 距離を増加してより良い視点を確保
+        
+        # スケールリファレンス情報を作成
+        bounds = np.array([points.min(axis=0), points.max(axis=0)])
+        scale_info = self.create_scale_reference(bounds) if with_scale else None
         
         for frame in range(num_frames):
             # 回転角度を計算
@@ -249,11 +966,23 @@ class Model3DVideoCreator:
             img = self._render_pointcloud_perspective(points, normals, colors, center, camera_pos, 
                                                    direction, image_size)
             
-            # テキストを追加
-            img = self.add_text_to_image(img, "Perspective", f"Pointcloud {rotation_axis.upper()}", frame)
+            # テキストとスケールを追加
+            img = self.add_text_to_image(img, "Point Cloud", f"Rotation {rotation_axis.upper()}", frame, scale_info)
             frames.append(img)
         
         return frames
+    
+    def apply_depth_shading(self, color: List[int], depth: float, max_depth: float) -> List[int]:
+        """深度に基づいて色調を調整"""
+        if not self.use_depth_shading or max_depth == 0:
+            return color
+            
+        # 深度を0-1に正規化
+        depth_ratio = min(depth / max_depth, 1.0)
+        # より遠い点ほど暗くする
+        shading_factor = 0.3 + 0.7 * (1.0 - depth_ratio)
+        
+        return [int(c * shading_factor) for c in color]
     
     def _render_wireframe(self, mesh: trimesh.Trimesh, center: np.ndarray, 
                          camera_pos: np.ndarray, view_vector: np.ndarray,
@@ -264,8 +993,15 @@ class Model3DVideoCreator:
         fov = 45
         aspect_ratio = image_size[0] / image_size[1]
         
-        # 画像を作成
-        img = np.ones((image_size[1], image_size[0], 3), dtype=np.uint8) * 255
+        # 背景色を改善
+        img = np.ones((image_size[1], image_size[0], 3), dtype=np.uint8) * np.array(self.background_color, dtype=np.uint8)
+        
+        # 深度情報を計算
+        all_depths = []
+        for vertex in mesh.vertices:
+            depth = np.linalg.norm(vertex - camera_pos)
+            all_depths.append(depth)
+        max_depth = max(all_depths) if all_depths else 1.0
         
         # 各面のエッジを描画
         for face in mesh.faces:
@@ -284,38 +1020,53 @@ class Model3DVideoCreator:
                                                       view_vector, right_vector, up_vector,
                                                       fov, aspect_ratio, image_size)
                 
-                # 線を描画
+                # 線を描画（深度シェーディング付き）
                 if start_2d is not None and end_2d is not None:
-                    self._draw_line(img, start_2d, end_2d, [100, 100, 100])
+                    # エッジの中点での深度を計算
+                    mid_vertex = (start_vertex + end_vertex) / 2
+                    depth = np.linalg.norm(mid_vertex - camera_pos)
+                    line_color = self.apply_depth_shading([80, 80, 80], depth, max_depth)
+                    self._draw_line(img, start_2d, end_2d, line_color)
         
         return img
     
     def get_point_color(self, mesh: trimesh.Trimesh, face_index: int, point_index: int = None) -> List[int]:
-        """点の色をメッシュから取得"""
+        """点の色をメッシュから取得（修正版）"""
         # デフォルト色（グレー）
         default_color = [150, 150, 150]
         
         try:
-            # 面の色情報をチェック
+            # 面の色情報をチェック（修正版）
             if hasattr(mesh.visual, 'face_colors') and mesh.visual.face_colors is not None:
                 if face_index < len(mesh.visual.face_colors):
                     face_color = mesh.visual.face_colors[face_index]
-                    # RGBAからRGBへ変換
-                    return [int(face_color[0]), int(face_color[1]), int(face_color[2])]
+                    # RGBA値の処理（0-1範囲の場合と0-255範囲の場合）
+                    if np.max(face_color[:3]) <= 1.0:
+                        # 0-1範囲の場合
+                        return [int(face_color[0] * 255), int(face_color[1] * 255), int(face_color[2] * 255)]
+                    else:
+                        # 0-255範囲の場合
+                        return [int(face_color[0]), int(face_color[1]), int(face_color[2])]
             
-            # 頂点の色情報をチェック
+            # 頂点の色情報をチェック（修正版）
             if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None:
                 if point_index is not None and point_index < len(mesh.visual.vertex_colors):
                     vertex_color = mesh.visual.vertex_colors[point_index]
-                    return [int(vertex_color[0]), int(vertex_color[1]), int(vertex_color[2])]
+                    if np.max(vertex_color[:3]) <= 1.0:
+                        return [int(vertex_color[0] * 255), int(vertex_color[1] * 255), int(vertex_color[2] * 255)]
+                    else:
+                        return [int(vertex_color[0]), int(vertex_color[1]), int(vertex_color[2])]
                 
-                # 面の頂点から平均色を計算
+                # 面の頂点から平均色を計算（修正版）
                 if face_index < len(mesh.faces):
                     face_vertices = mesh.faces[face_index]
                     colors = []
                     for vertex_idx in face_vertices:
                         if vertex_idx < len(mesh.visual.vertex_colors):
-                            colors.append(mesh.visual.vertex_colors[vertex_idx][:3])
+                            vert_color = mesh.visual.vertex_colors[vertex_idx][:3]
+                            if np.max(vert_color) <= 1.0:
+                                vert_color = vert_color * 255
+                            colors.append(vert_color)
                     
                     if colors:
                         avg_color = np.mean(colors, axis=0)
@@ -326,7 +1077,10 @@ class Model3DVideoCreator:
                 if hasattr(mesh.visual.material, 'diffuse'):
                     diffuse = mesh.visual.material.diffuse
                     if diffuse is not None and len(diffuse) >= 3:
-                        return [int(diffuse[0] * 255), int(diffuse[1] * 255), int(diffuse[2] * 255)]
+                        if np.max(diffuse[:3]) <= 1.0:
+                            return [int(diffuse[0] * 255), int(diffuse[1] * 255), int(diffuse[2] * 255)]
+                        else:
+                            return [int(diffuse[0]), int(diffuse[1]), int(diffuse[2])]
             
             return default_color
             
@@ -339,8 +1093,12 @@ class Model3DVideoCreator:
                                      direction: np.ndarray, 
                                      image_size: Tuple[int, int]) -> np.ndarray:
         """点群を簡単な平行投影でレンダリング（動作を確実にするため）"""
-        # 画像を作成
-        img = np.ones((image_size[1], image_size[0], 3), dtype=np.uint8) * 255
+        # 画像を作成（改善された背景色）
+        img = np.ones((image_size[1], image_size[0], 3), dtype=np.uint8) * np.array(self.background_color)
+        
+        # 深度情報を計算
+        depths = np.linalg.norm(points - camera_pos, axis=1)
+        max_depth = np.max(depths) if len(depths) > 0 else 1.0
         
         # 上方向ベクトルを設定
         if abs(direction[1]) > 0.9:  # 上面または下面ビュー
@@ -399,28 +1157,35 @@ class Model3DVideoCreator:
                     if dot_product < 0:
                         visible = False
                 
-                # モデルの色を使用
+                # モデルの色を使用（深度シェーディング付き）
                 if i < len(colors):
-                    point_color = [int(colors[i][0]), int(colors[i][1]), int(colors[i][2])]
+                    base_color = [int(colors[i][0]), int(colors[i][1]), int(colors[i][2])]
                 else:
-                    point_color = [150, 150, 150]
+                    base_color = [150, 150, 150]
                 
-                # 見える点のみ描画
+                # 深度シェーディングを適用
+                depth = depths[i] if i < len(depths) else max_depth
+                point_color = self.apply_depth_shading(base_color, depth, max_depth)
+                
+                # 見える点のみ描画（より大きなサイズで）
                 if visible and 0 <= pixel_x < image_size[0] and 0 <= pixel_y < image_size[1]:
-                    # 3x3の点を描画
-                    for dx in [-1, 0, 1]:
-                        for dy in [-1, 0, 1]:
+                    # 可変サイズの点を描画
+                    point_size = 2
+                    for dx in range(-point_size, point_size + 1):
+                        for dy in range(-point_size, point_size + 1):
                             px, py = pixel_x + dx, pixel_y + dy
                             if 0 <= px < image_size[0] and 0 <= py < image_size[1]:
-                                img[py, px] = point_color
+                                distance = (dx**2 + dy**2)**0.5
+                                if distance <= point_size:
+                                    img[py, px] = point_color
         
         return img
     
-    def create_cross_section_frames(self, points: np.ndarray, normals: np.ndarray, colors: np.ndarray,
+    def create_cross_section_frames(self, mesh: trimesh.Trimesh, points: np.ndarray, normals: np.ndarray, colors: np.ndarray,
                                    num_frames: int = 60,
                                    image_size: Tuple[int, int] = (800, 600),
                                    section_axis: str = 'z') -> List[np.ndarray]:
-        """断面図のフレームを作成"""
+        """真の幾何学的断面図フレームを作成"""
         frames = []
         
         # 点群の境界を取得
@@ -440,28 +1205,30 @@ class Model3DVideoCreator:
             section_min = points[:, 2].min()
             section_max = points[:, 2].max()
         
-        # 断面の範囲を設定（中央80%の範囲）
+        # 断面の範囲を設定（端から端まで完全に）
         range_size = section_max - section_min
-        start_pos = section_min + range_size * 0.1
-        end_pos = section_max - range_size * 0.1
+        start_pos = section_min + range_size * 0.05  # 端から5%マージン
+        end_pos = section_max - range_size * 0.05    # 端まで5%マージン
         
         for frame in range(num_frames):
             # 断面位置を計算
             t = frame / (num_frames - 1) if num_frames > 1 else 0
             section_pos = start_pos + t * (end_pos - start_pos)
             
-            # 断面の厚みを設定
-            thickness = range_size * 0.02  # 全体の2%の厚み
+            # 真の幾何学的断面を計算
+            cross_section_points, cross_section_colors = self._compute_geometric_cross_section(
+                mesh, section_pos, section_axis)
             
-            # 断面内の点を抽出
-            mask = (points[:, axis_index] >= section_pos - thickness) & \
-                   (points[:, axis_index] <= section_pos + thickness)
+            # 断面情報を追加
+            section_info = {
+                'axis': section_axis,
+                'position': section_pos,
+                'range_min': section_min,
+                'range_max': section_max,
+                'point_count': len(cross_section_points)
+            }
             
-            section_points = points[mask]
-            section_normals = normals[mask] if normals is not None else None
-            section_colors = colors[mask] if colors is not None else None
-            
-            if len(section_points) == 0:
+            if len(cross_section_points) == 0:
                 # 点がない場合は空の画像
                 img = np.ones((image_size[1], image_size[0], 3), dtype=np.uint8) * 240
                 progress = (frame / (num_frames - 1)) * 100 if num_frames > 1 else 0
@@ -472,9 +1239,9 @@ class Model3DVideoCreator:
                 frames.append(img)
                 continue
             
-            # 断面を正面から描画
-            img = self._render_cross_section(section_points, section_normals, section_colors,
-                                           section_axis, image_size)
+            # 真の断面を描画
+            img = self._render_geometric_cross_section(cross_section_points, cross_section_colors,
+                                                     section_axis, image_size, section_info)
             
             # テキストを追加（断面情報を詳細に）
             progress = (frame / (num_frames - 1)) * 100 if num_frames > 1 else 0
@@ -483,6 +1250,264 @@ class Model3DVideoCreator:
             frames.append(img)
         
         return frames
+    
+    def _compute_geometric_cross_section(self, mesh: trimesh.Trimesh, section_pos: float, 
+                                       section_axis: str) -> Tuple[np.ndarray, np.ndarray]:
+        """真の幾何学的断面を計算"""
+        try:
+            # 断面平面を定義
+            if section_axis == 'x':
+                plane_normal = np.array([1, 0, 0])
+                plane_origin = np.array([section_pos, 0, 0])
+            elif section_axis == 'y':
+                plane_normal = np.array([0, 1, 0])
+                plane_origin = np.array([0, section_pos, 0])
+            else:  # 'z'
+                plane_normal = np.array([0, 0, 1])
+                plane_origin = np.array([0, 0, section_pos])
+            
+            # メッシュと平面の交線を計算
+            try:
+                slice_result = mesh.section(plane_origin=plane_origin, plane_normal=plane_normal)
+                
+                if slice_result is not None and hasattr(slice_result, 'vertices'):
+                    # 交線の頂点を取得
+                    section_points = slice_result.vertices
+                    
+                    # 断面の色を決定（構造を示すための適切な色）
+                    section_colors = self._generate_cross_section_colors(section_points, section_axis)
+                    
+                    print(f"Geometric cross-section: {len(section_points)} intersection points")
+                    return section_points, section_colors
+                    
+            except Exception as slice_error:
+                print(f"Mesh slice failed: {slice_error}")
+            
+            # フォールバック: エッジと平面の交点を手動計算
+            intersection_points = []
+            
+            for edge in mesh.edges_unique:
+                v1, v2 = mesh.vertices[edge]
+                
+                # エッジが平面を横切るかチェック
+                d1 = np.dot(v1 - plane_origin, plane_normal)
+                d2 = np.dot(v2 - plane_origin, plane_normal)
+                
+                # エッジが平面を横切る場合
+                if d1 * d2 < 0:  # 符号が異なる
+                    # 交点を計算
+                    t = d1 / (d1 - d2)
+                    intersection = v1 + t * (v2 - v1)
+                    intersection_points.append(intersection)
+            
+            if intersection_points:
+                section_points = np.array(intersection_points)
+                section_colors = self._generate_cross_section_colors(section_points, section_axis)
+                print(f"Manual cross-section: {len(section_points)} intersection points")
+                return section_points, section_colors
+            
+        except Exception as e:
+            print(f"Cross-section computation failed: {e}")
+        
+        # すべて失敗した場合は空を返す
+        return np.array([]), np.array([])
+    
+    def _generate_cross_section_colors(self, points: np.ndarray, section_axis: str) -> np.ndarray:
+        """断面用の適切な色を生成"""
+        if len(points) == 0:
+            return np.array([])
+        
+        # 断面軸に応じた基本色を設定
+        base_colors = {
+            'x': [220, 100, 100],  # 赤系
+            'y': [100, 220, 100],  # 緑系
+            'z': [100, 100, 220]   # 青系
+        }
+        base_color = base_colors.get(section_axis, [150, 150, 150])
+        
+        # 断面内での位置に基づいて色の濃淡を変える
+        colors = []
+        
+        # 中心からの距離を計算
+        center = points.mean(axis=0)
+        distances = np.linalg.norm(points - center, axis=1)
+        max_distance = np.max(distances) if len(distances) > 0 else 1.0
+        
+        for i, distance in enumerate(distances):
+            # 中心から遠いほど濃く、近いほど薄く
+            intensity = 0.3 + 0.7 * (distance / max_distance) if max_distance > 0 else 0.5
+            color = [int(c * intensity) for c in base_color]
+            colors.append(color)
+        
+        return np.array(colors)
+    
+    def _render_geometric_cross_section(self, points: np.ndarray, colors: np.ndarray,
+                                      section_axis: str, image_size: Tuple[int, int], 
+                                      section_info: Dict) -> np.ndarray:
+        """幾何学的断面を正確に描画"""
+        # 背景を白に設定
+        img = np.ones((image_size[1], image_size[0], 3), dtype=np.uint8) * 255
+        
+        if len(points) == 0:
+            return img
+        
+        # 断面軸に応じて投影軸を選択
+        if section_axis == 'x':
+            # YZ平面に投影
+            proj_x = points[:, 1]  # Y軸
+            proj_y = points[:, 2]  # Z軸
+        elif section_axis == 'y':
+            # XZ平面に投影
+            proj_x = points[:, 0]  # X軸
+            proj_y = points[:, 2]  # Z軸
+        else:  # 'z'
+            # XY平面に投影
+            proj_x = points[:, 0]  # X軸
+            proj_y = points[:, 1]  # Y軸
+        
+        if len(proj_x) == 0:
+            return img
+        
+        # 投影範囲を計算
+        x_min, x_max = proj_x.min(), proj_x.max()
+        y_min, y_max = proj_y.min(), proj_y.max()
+        
+        # アスペクト比を保持してマージンを追加
+        x_range = max(x_max - x_min, 1e-6)
+        y_range = max(y_max - y_min, 1e-6)
+        
+        # 正方形に調整（円形断面を正しく表示するため）
+        max_range = max(x_range, y_range)
+        x_center = (x_max + x_min) / 2
+        y_center = (y_max + y_min) / 2
+        
+        margin = 0.15
+        x_min = x_center - max_range * (0.5 + margin)
+        x_max = x_center + max_range * (0.5 + margin)
+        y_min = y_center - max_range * (0.5 + margin)
+        y_max = y_center + max_range * (0.5 + margin)
+        
+        # 点を並べ替えて線を描画（輪郭線として）
+        if len(points) > 2:
+            # 点を角度順に並べ替え
+            center_2d = np.array([proj_x.mean(), proj_y.mean()])
+            angles = np.arctan2(proj_y - center_2d[1], proj_x - center_2d[0])
+            sorted_indices = np.argsort(angles)
+            
+            # 並べ替えた順序で線を描画
+            prev_pixel = None
+            for i in sorted_indices:
+                point_x, point_y = proj_x[i], proj_y[i]
+                
+                # 画像座標に変換
+                pixel_x = int((point_x - x_min) / (x_max - x_min) * (image_size[0] - 1))
+                pixel_y = int((point_y - y_min) / (y_max - y_min) * (image_size[1] - 1))
+                pixel_y = image_size[1] - 1 - pixel_y  # Y軸を反転
+                
+                if 0 <= pixel_x < image_size[0] and 0 <= pixel_y < image_size[1]:
+                    # 線の色
+                    if i < len(colors):
+                        line_color = colors[i].tolist()
+                    else:
+                        line_color = [150, 150, 150]
+                    
+                    # 線を描画
+                    if prev_pixel is not None:
+                        cv2.line(img, prev_pixel, (pixel_x, pixel_y), line_color, 2)
+                    
+                    # 点も描画
+                    cv2.circle(img, (pixel_x, pixel_y), 3, line_color, -1)
+                    
+                    prev_pixel = (pixel_x, pixel_y)
+            
+            # 最後の点と最初の点を繋ぐ
+            if prev_pixel is not None and len(sorted_indices) > 0:
+                first_idx = sorted_indices[0]
+                first_x = int((proj_x[first_idx] - x_min) / (x_max - x_min) * (image_size[0] - 1))
+                first_y = int((proj_y[first_idx] - y_min) / (y_max - y_min) * (image_size[1] - 1))
+                first_y = image_size[1] - 1 - first_y
+                
+                if 0 <= first_x < image_size[0] and 0 <= first_y < image_size[1]:
+                    first_color = colors[first_idx].tolist() if first_idx < len(colors) else [150, 150, 150]
+                    cv2.line(img, prev_pixel, (first_x, first_y), first_color, 2)
+        
+        return img
+    
+    def _render_enhanced_cross_section(self, points: np.ndarray, normals: np.ndarray, colors: np.ndarray,
+                                     section_axis: str, image_size: Tuple[int, int], 
+                                     section_info: Dict) -> np.ndarray:
+        """改善された断面レンダリング（色付きで詳細表示）"""
+        # 背景を淡いグレーに設定
+        img = np.ones((image_size[1], image_size[0], 3), dtype=np.uint8) * 240
+        
+        if len(points) == 0:
+            return img
+        
+        # 断面軸に応じて投影軸を選択
+        if section_axis == 'x':
+            # YZ平面に投影
+            proj_x = points[:, 1]  # Y軸
+            proj_y = points[:, 2]  # Z軸
+        elif section_axis == 'y':
+            # XZ平面に投影
+            proj_x = points[:, 0]  # X軸
+            proj_y = points[:, 2]  # Z軸
+        else:  # 'z'
+            # XY平面に投影
+            proj_x = points[:, 0]  # X軸
+            proj_y = points[:, 1]  # Y軸
+        
+        # 投影範囲を計算
+        x_min, x_max = proj_x.min(), proj_x.max()
+        y_min, y_max = proj_y.min(), proj_y.max()
+        
+        # マージンを追加
+        margin = 0.1
+        x_range = max(x_max - x_min, 1e-6)
+        y_range = max(y_max - y_min, 1e-6)
+        x_min -= x_range * margin
+        x_max += x_range * margin
+        y_min -= y_range * margin
+        y_max += y_range * margin
+        
+        # 各点を描画（色付きで大きなサイズ）
+        for i, (point_x, point_y) in enumerate(zip(proj_x, proj_y)):
+            # 画像座標に変換
+            pixel_x = int((point_x - x_min) / (x_max - x_min) * (image_size[0] - 1))
+            pixel_y = int((point_y - y_min) / (y_max - y_min) * (image_size[1] - 1))
+            pixel_y = image_size[1] - 1 - pixel_y  # Y軸を反転
+            
+            # 色を決定（改善された色情報を使用）
+            if i < len(colors):
+                point_color = [int(colors[i][0]), int(colors[i][1]), int(colors[i][2])]
+            else:
+                # フォールバック色（断面の深度に基づく）
+                depth_ratio = i / len(points) if len(points) > 0 else 0
+                point_color = [
+                    int(255 * (1 - depth_ratio * 0.5)),  # 赤成分
+                    int(255 * depth_ratio),               # 緑成分  
+                    int(150)                              # 青成分
+                ]
+            
+            # より大きな点を描画（断面の詳細を強調）
+            point_size = 4
+            if 0 <= pixel_x < image_size[0] and 0 <= pixel_y < image_size[1]:
+                for dx in range(-point_size, point_size + 1):
+                    for dy in range(-point_size, point_size + 1):
+                        px, py = pixel_x + dx, pixel_y + dy
+                        if 0 <= px < image_size[0] and 0 <= py < image_size[1]:
+                            distance = (dx**2 + dy**2)**0.5
+                            if distance <= point_size:
+                                # 距離に基づく色の減衰
+                                intensity = max(0.3, 1.0 - distance / point_size)
+                                final_color = [int(c * intensity) for c in point_color]
+                                img[py, px] = final_color
+        
+        # 断面の輪郭を描画（改善版）
+        self._draw_enhanced_cross_section_outline(img, proj_x, proj_y, x_min, x_max, y_min, y_max, 
+                                                image_size, section_info)
+        
+        return img
     
     def _render_cross_section(self, points: np.ndarray, normals: np.ndarray, colors: np.ndarray,
                              section_axis: str, image_size: Tuple[int, int]) -> np.ndarray:
@@ -554,6 +1579,54 @@ class Model3DVideoCreator:
         self._draw_cross_section_outline(img, proj_x, proj_y, x_min, x_max, y_min, y_max, image_size)
         
         return img
+    
+    def _draw_enhanced_cross_section_outline(self, img: np.ndarray, proj_x: np.ndarray, proj_y: np.ndarray,
+                                           x_min: float, x_max: float, y_min: float, y_max: float,
+                                           image_size: Tuple[int, int], section_info: Dict):
+        """断面の改善された輪郭線を描画"""
+        try:
+            from scipy.spatial import ConvexHull
+            
+            # 2D投影点を結合
+            points_2d = np.column_stack([proj_x, proj_y])
+            
+            if len(points_2d) < 3:
+                return
+            
+            # コンベックスハルを計算
+            hull = ConvexHull(points_2d)
+            
+            # ハルの頂点を画像座標に変換
+            hull_points_pixel = []
+            for vertex in hull.vertices:
+                point_x, point_y = points_2d[vertex]
+                pixel_x = int((point_x - x_min) / (x_max - x_min) * (image_size[0] - 1))
+                pixel_y = int((point_y - y_min) / (y_max - y_min) * (image_size[1] - 1))
+                pixel_y = image_size[1] - 1 - pixel_y
+                hull_points_pixel.append((pixel_x, pixel_y))
+            
+            # 断面の厚みに応じて線の太さを調整
+            line_thickness = max(1, int(4 * section_info['thickness'] / 0.01))
+            
+            # 輪郭線を描画（色は断面軸に応じて変更）
+            outline_colors = {
+                'x': (220, 50, 50),   # 赤系
+                'y': (50, 220, 50),   # 緑系  
+                'z': (50, 50, 220)    # 青系
+            }
+            outline_color = outline_colors.get(section_info['axis'], (100, 100, 100))
+            
+            for i in range(len(hull_points_pixel)):
+                start = hull_points_pixel[i]
+                end = hull_points_pixel[(i + 1) % len(hull_points_pixel)]
+                cv2.line(img, start, end, outline_color, line_thickness)
+                
+        except ImportError:
+            # scipyがない場合は簡単な輪郭を描画
+            self._draw_simple_boundary(img, proj_x, proj_y, x_min, x_max, y_min, y_max, image_size)
+        except Exception:
+            # エラーの場合は簡単な輪郭を描画
+            self._draw_simple_boundary(img, proj_x, proj_y, x_min, x_max, y_min, y_max, image_size)
     
     def _draw_cross_section_outline(self, img: np.ndarray, proj_x: np.ndarray, proj_y: np.ndarray,
                                    x_min: float, x_max: float, y_min: float, y_max: float,
@@ -768,9 +1841,9 @@ class Model3DVideoCreator:
                 points, normals, colors, num_frames, (cell_width, cell_height), rotation_axis=axis
             )
             
-            # 断面図フレーム
+            # 断面図フレーム（メッシュも渡す）
             cross_section_frames = self.create_cross_section_frames(
-                points, normals, colors, num_frames, (cell_width, cell_height), section_axis=axis
+                mesh, points, normals, colors, num_frames, (cell_width, cell_height), section_axis=axis
             )
             
             all_frames[axis] = {
@@ -871,7 +1944,9 @@ class Model3DVideoCreator:
                              rotation_axes: List[str] = ['x', 'y', 'z'],
                              include_cross_sections: bool = True,
                              create_combined: bool = True,
-                             create_individual: bool = False):
+                             create_individual: bool = False,
+                             enable_zoom_details: bool = True,
+                             video_resolution: Tuple[int, int] = (1920, 1080)):
         """回転動画と断面図動画を作成"""
         # モデルを読み込み
         mesh = self.load_model(model_path)
@@ -880,8 +1955,9 @@ class Model3DVideoCreator:
         
         model_name = Path(model_path).stem
         
-        # 点群を抽出
-        points, normals, colors = self.extract_pointcloud(mesh)
+        # 点群を抽出（点数を調整）
+        point_count = min(3000, len(mesh.vertices) // 3)  # 大きなモデルでは点数を制限
+        points, normals, colors = self.extract_pointcloud(mesh, point_count)
         
         print(f"Creating videos for {model_name}")
         print(f"Mesh vertices: {len(mesh.vertices)}")
@@ -892,10 +1968,21 @@ class Model3DVideoCreator:
             print("Creating comprehensive X,Y,Z axis analysis video...")
             combined_frames = self.create_combined_frames(
                 mesh, points, normals, colors, num_frames, 
-                image_size=(1200, 900), rotation_axes=['x', 'y', 'z']  # 常に全軸
+                image_size=video_resolution, rotation_axes=['x', 'y', 'z']  # 常に全軸
             )
             combined_video_path = str(self.output_dir / f"{model_name}_xyz_analysis.mp4")
-            self.create_video_from_frames(combined_frames, combined_video_path, fps)
+            self.create_video_from_frames(combined_frames, combined_video_path, fps=60)  # 高品質FPS
+            
+            # ズーム詳細動画も作成
+            if enable_zoom_details:
+                print("Creating detailed zoom analysis video...")
+                zoom_frames = self.create_zoom_in_frames(
+                    mesh, points, normals, colors, num_frames // 2, 
+                    image_size=(video_resolution[0]//2, video_resolution[1]//2),
+                    zoom_factor=4.0, visualization_mode='pointcloud'
+                )
+                zoom_video_path = str(self.output_dir / f"{model_name}_zoom_details.mp4")
+                self.create_video_from_frames(zoom_frames, zoom_video_path, fps=30)
         
         # 個別動画を作成（オプション）
         if create_individual:
@@ -922,38 +2009,53 @@ class Model3DVideoCreator:
                     print(f"Creating {axis}-axis cross-section videos...")
                     
                     cross_section_frames = self.create_cross_section_frames(
-                        points, normals, colors, num_frames, section_axis=axis
+                        mesh, points, normals, colors, num_frames, section_axis=axis
                     )
                     cross_section_video_path = str(self.output_dir / f"{model_name}_cross_section_{axis}.mp4")
                     self.create_video_from_frames(cross_section_frames, cross_section_video_path, fps)
         
         if create_combined:
             print(f"\n✓ Comprehensive analysis video created: {model_name}_xyz_analysis.mp4")
+            if enable_zoom_details:
+                print(f"✓ Detailed zoom analysis video created: {model_name}_zoom_details.mp4")
         if create_individual:
             print(f"\n✓ Individual videos also created")
         print(f"\nAll videos saved in: {self.output_dir}")
 
 def main():
-    parser = argparse.ArgumentParser(description="3DモデルのX,Y,Z軸統合解析動画作成")
+    parser = argparse.ArgumentParser(description="3DモデルのGemini分析用動画作成 - 高品質多角度解析")
     parser.add_argument("model_path", help="3Dモデルファイルのパス")
-    parser.add_argument("--frames", type=int, default=60, help="フレーム数 (デフォルト: 60)")
-    parser.add_argument("--fps", type=int, default=30, help="FPS (デフォルト: 30)")
+    parser.add_argument("--frames", type=int, default=90, help="フレーム数 (デフォルト: 90)")
+    parser.add_argument("--fps", type=int, default=60, help="FPS (デフォルト: 60)")
     parser.add_argument("--axes", nargs='+', default=['x', 'y', 'z'], 
                        choices=['x', 'y', 'z'], help="個別動画用回転軸 (統合動画は常にX,Y,Z全軸)")
     parser.add_argument("--output", help="出力ディレクトリ")
+    parser.add_argument("--scale-reference", type=float, help="スケールリファレンスサイズ (単位)")
+    parser.add_argument("--resolution", choices=['720p', '1080p', '4k'], default='1080p',
+                       help="動画解像度 (デフォルト: 1080p)")
     parser.add_argument("--no-cross-sections", action="store_true", 
                        help="断面図動画を作成しない")
     parser.add_argument("--individual", action="store_true", 
                        help="個別動画も作成する")
     parser.add_argument("--no-combined", action="store_true", 
                        help="統合動画を作成しない")
+    parser.add_argument("--no-zoom", action="store_true", 
+                       help="ズーム詳細動画を作成しない")
     
     args = parser.parse_args()
     
-    # 動画作成クラスを初期化
-    video_creator = Model3DVideoCreator(args.output)
+    # 解像度設定
+    resolution_map = {
+        '720p': (1280, 720),
+        '1080p': (1920, 1080),
+        '4k': (3840, 2160)
+    }
+    video_resolution = resolution_map[args.resolution]
     
-    # X,Y,Z軸統合解析動画を作成
+    # 動画作成クラスを初期化
+    video_creator = Model3DVideoCreator(args.output, args.scale_reference)
+    
+    # Gemini分析用高品質動画を作成
     video_creator.create_rotation_videos(
         args.model_path,
         num_frames=args.frames,
@@ -961,7 +2063,9 @@ def main():
         rotation_axes=args.axes,  # 個別動画用
         include_cross_sections=not args.no_cross_sections,
         create_combined=not args.no_combined,
-        create_individual=args.individual
+        create_individual=args.individual,
+        enable_zoom_details=not args.no_zoom,
+        video_resolution=video_resolution
     )
 
 if __name__ == "__main__":
