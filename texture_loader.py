@@ -307,18 +307,21 @@ class TextureLoader:
         return mesh
     
     def _apply_texture_to_mesh(self, mesh: trimesh.Trimesh, texture_path: Path) -> trimesh.Trimesh:
-        """テクスチャ画像をメッシュに適用"""
+        """テクスチャ画像をメッシュに適用（強化版）"""
         try:
             texture_image = Image.open(texture_path).convert('RGB')
             texture_array = np.array(texture_image)
             
-            print(f"Texture loaded: {texture_array.shape}")
+            # コントラストを強化
+            texture_array = self._enhance_texture_contrast(texture_array)
+            
+            print(f"Texture loaded and enhanced: {texture_array.shape}")
             
             # UV座標がある場合
             if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
                 vertex_colors = self._map_texture_to_vertices(mesh.visual.uv, texture_array)
                 mesh.visual.vertex_colors = vertex_colors
-                print(f"Applied texture to {len(vertex_colors)} vertices")
+                print(f"Applied enhanced texture to {len(vertex_colors)} vertices")
             else:
                 # 平均色を使用
                 avg_color = np.mean(texture_array.reshape(-1, 3), axis=0)
@@ -363,3 +366,21 @@ class TextureLoader:
         except Exception as e:
             print(f"Error applying color: {e}")
             return mesh
+    
+    def _enhance_texture_contrast(self, texture_array: np.ndarray, factor: float = 1.3) -> np.ndarray:
+        """テクスチャのコントラストを強化"""
+        try:
+            # 0-1の範囲に正規化
+            normalized = texture_array.astype(np.float32) / 255.0
+            
+            # コントラスト強化（S字カーブ）
+            enhanced = np.power(normalized, 1.0 / factor)
+            
+            # 0-255の範囲に戻す
+            enhanced = np.clip(enhanced * 255, 0, 255).astype(np.uint8)
+            
+            return enhanced
+            
+        except Exception as e:
+            print(f"Error enhancing contrast: {e}")
+            return texture_array

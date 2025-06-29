@@ -118,7 +118,11 @@ class Model3DVideoCreator:
         print(f"Color info - Vertex colors: {has_vertex_colors}, Face colors: {has_face_colors}, Material: {has_material}")
         
         for i, face_idx in enumerate(face_indices):
-            color = self.get_enhanced_point_color(mesh, face_idx, points[i])
+            # 面の最初の頂点を使用（高速化）
+            face_vertices = mesh.faces[face_idx]
+            closest_vertex = face_vertices[0]
+            
+            color = self.get_enhanced_point_color_with_vertex(mesh, face_idx, points[i], closest_vertex)
             colors.append(color)
         
         colors = np.array(colors)
@@ -130,17 +134,67 @@ class Model3DVideoCreator:
         return points, normals, colors
     
     def get_enhanced_point_color(self, mesh: trimesh.Trimesh, face_index: int, point_position: np.ndarray) -> List[int]:
-        """改善された色取得（位置ベースの色生成も含む）"""
-        # まず既存の色情報を試す
-        existing_color = self.get_point_color(mesh, face_index, None)
+        """改善された色取得（テクスチャ優先版）"""
+        # メッシュにテクスチャ/マテリアル情報があるかチェック
+        has_texture_info = False
         
-        # デフォルトグレー以外の色が取得できて、かつ興味深い色の場合はそれを使用
-        if existing_color != [150, 150, 150]:
-            # 色の多様性をチェック（すべて同じ値の場合は位置ベース色を使用）
-            if not (existing_color[0] == existing_color[1] == existing_color[2]):
+        # 頂点色の存在と多様性をチェック
+        if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None:
+            # 頂点色の分散を計算
+            colors = mesh.visual.vertex_colors[:, :3]  # RGB成分のみ
+            color_variance = np.var(colors.flatten())
+            if color_variance > 50:  # 閾値を下げてより敏感に
+                has_texture_info = True
+                print(f"Texture detected: color variance = {color_variance:.2f}")
+        
+        # マテリアル情報があるかチェック
+        if hasattr(mesh.visual, 'material') and mesh.visual.material is not None:
+            has_texture_info = True
+            print("Material texture detected")
+        
+        # UV座標があるかチェック（テクスチャマッピングの証拠）
+        if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
+            has_texture_info = True
+            print("UV coordinates detected")
+        
+        # テクスチャ情報がある場合は既存の色を使用
+        if has_texture_info:
+            existing_color = self.get_point_color(mesh, face_index, None)
+            # グレーでなければテクスチャ色を使用
+            if existing_color != [150, 150, 150]:
                 return existing_color
         
-        # 色情報がないか単調な場合、位置ベースで色を生成
+        # テクスチャ情報がない場合のみ位置ベース色を生成
+        return self.color_generator.generate_position_based_color(point_position, mesh.bounds)
+    
+    def get_enhanced_point_color_with_vertex(self, mesh: trimesh.Trimesh, face_index: int, 
+                                           point_position: np.ndarray, vertex_index: int) -> List[int]:
+        """頂点インデックス付きの改善された色取得"""
+        # メッシュにテクスチャ/マテリアル情報があるかチェック
+        has_texture_info = False
+        
+        # 頂点色の存在と多様性をチェック
+        if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None:
+            colors = mesh.visual.vertex_colors[:, :3]  # RGB成分のみ
+            color_variance = np.var(colors.flatten())
+            if color_variance > 50:
+                has_texture_info = True
+        
+        # マテリアル情報があるかチェック
+        if hasattr(mesh.visual, 'material') and mesh.visual.material is not None:
+            has_texture_info = True
+        
+        # UV座標があるかチェック
+        if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
+            has_texture_info = True
+        
+        # テクスチャ情報がある場合は頂点色を優先使用
+        if has_texture_info:
+            existing_color = self.get_point_color(mesh, face_index, vertex_index)
+            if existing_color != [150, 150, 150]:
+                return existing_color
+        
+        # テクスチャ情報がない場合のみ位置ベース色を生成
         return self.color_generator.generate_position_based_color(point_position, mesh.bounds)
     
     def create_scale_reference(self, mesh_bounds: np.ndarray) -> Dict:
@@ -292,31 +346,44 @@ class Model3DVideoCreator:
                     [-sin_a, 0, cos_a]
                 ])
             
-            # 回転軸に応じて初期カメラ位置を設定
+            # 統一された一方向回転（点群と同じロジック）
             if rotation_axis == 'x':
-                base_camera_pos = np.array([0, 0, 1]) * distance  # Z軸から見る
+                # X軸周り: YZ平面で一方向回転
+                camera_pos = center + np.array([0, np.cos(angle), np.sin(angle)]) * distance
             elif rotation_axis == 'y':
-                base_camera_pos = np.array([0, 0, 1]) * distance  # Z軸から見る
+                # Y軸周り: XZ平面で一方向回転
+                camera_pos = center + np.array([np.sin(angle), 0, np.cos(angle)]) * distance
             else:  # 'z'
-                base_camera_pos = np.array([1, 0, 0]) * distance  # X軸から見る
-            
-            # カメラ位置を回転
-            camera_pos = center + np.dot(rotation_matrix, base_camera_pos)
+                # Z軸周り: XY平面で一方向回転
+                camera_pos = center + np.array([np.cos(angle), np.sin(angle), 0]) * distance
             
             # 視線ベクトル
             view_vector = center - camera_pos
             view_vector = view_vector / np.linalg.norm(view_vector)
             
-            # 上方向ベクトル
-            up_vector = np.array([0, 1, 0])
+            # 上方向ベクトルを動的に設定（視線ベクトルと平行にならないように）
+            if abs(view_vector[1]) > 0.9:  # Y軸とほぼ平行の場合
+                up_vector = np.array([0, 0, 1])  # Z軸を上方向に
+            else:
+                up_vector = np.array([0, 1, 0])  # Y軸を上方向に
             
             # 右方向ベクトル
             right_vector = np.cross(view_vector, up_vector)
-            right_vector = right_vector / np.linalg.norm(right_vector)
+            right_norm = np.linalg.norm(right_vector)
+            if right_norm > 1e-6:
+                right_vector = right_vector / right_norm
+            else:
+                # フォールバック
+                right_vector = np.array([1, 0, 0])
             
             # 上方向ベクトルを再計算
             up_vector = np.cross(right_vector, view_vector)
-            up_vector = up_vector / np.linalg.norm(up_vector)
+            up_norm = np.linalg.norm(up_vector)
+            if up_norm > 1e-6:
+                up_vector = up_vector / up_norm
+            else:
+                # フォールバック
+                up_vector = np.array([0, 1, 0])
             
             # ワイヤーフレーム画像を作成
             img = self._render_wireframe(mesh, center, camera_pos, view_vector, 
@@ -346,40 +413,45 @@ class Model3DVideoCreator:
         scale_info = self.create_scale_reference(bounds) if with_scale else None
         
         for frame in range(num_frames):
-            # 回転角度を計算
+            # 回転角度を計算（完全一方向回転）
             angle = (frame / num_frames) * 2 * np.pi
+            if frame == 0 or frame == num_frames // 2 or frame == num_frames - 1:
+                pass  # ログを削除
             
-            # 回転行列を作成
+            # 回転行列を作成（カメラを一方向に回転させる）
             cos_a, sin_a = np.cos(angle), np.sin(angle)
             if rotation_axis == 'x':
+                # X軸周りの一方向回転
                 rotation_matrix = np.array([
                     [1, 0, 0],
                     [0, cos_a, -sin_a],
                     [0, sin_a, cos_a]
                 ])
             elif rotation_axis == 'z':
+                # Z軸周りの一方向回転
                 rotation_matrix = np.array([
                     [cos_a, -sin_a, 0],
                     [sin_a, cos_a, 0],
                     [0, 0, 1]
                 ])
             else:  # 'y'
+                # Y軸周りの一方向回転
                 rotation_matrix = np.array([
                     [cos_a, 0, sin_a],
                     [0, 1, 0],
                     [-sin_a, 0, cos_a]
                 ])
             
-            # 回転軸に応じて初期カメラ位置を設定
+            # 統一された一方向回転（右手座標系）
             if rotation_axis == 'x':
-                base_camera_pos = np.array([0, 0, 1]) * distance  # Z軸から見る
+                # X軸周り: YZ平面で一方向回転
+                camera_pos = center + np.array([0, np.cos(angle), np.sin(angle)]) * distance
             elif rotation_axis == 'y':
-                base_camera_pos = np.array([0, 0, 1]) * distance  # Z軸から見る
+                # Y軸周り: XZ平面で一方向回転
+                camera_pos = center + np.array([np.sin(angle), 0, np.cos(angle)]) * distance
             else:  # 'z'
-                base_camera_pos = np.array([1, 0, 0]) * distance  # X軸から見る
-            
-            # カメラ位置を回転
-            camera_pos = center + np.dot(rotation_matrix, base_camera_pos)
+                # Z軸周り: XY平面で一方向回転
+                camera_pos = center + np.array([np.cos(angle), np.sin(angle), 0]) * distance
             
             # 視線ベクトル（カメラからオブジェクトへ）
             direction = center - camera_pos
@@ -415,74 +487,91 @@ class Model3DVideoCreator:
             all_depths.append(depth)
         max_depth = max(all_depths) if all_depths else 1.0
         
-        # 各面のエッジを描画
-        for face in mesh.faces:
-            face_vertices = mesh.vertices[face]
+        # エッジを効率的に抽出（重複排除）
+        edges = mesh.edges_unique
+        
+        # LOD（Level of Detail）を適用 - 大きなメッシュの場合はエッジを間引く
+        if len(edges) > 50000:  # 5万エッジより多い場合は間引く
+            step = max(1, len(edges) // 30000)  # 最大3万エッジに制限
+            edges = edges[::step]
+        else:
+            pass  # ログを削除
+        
+        # 各エッジを描画
+        for edge in edges:
+            start_vertex = mesh.vertices[edge[0]]
+            end_vertex = mesh.vertices[edge[1]]
             
-            # 各エッジを描画
-            for i in range(3):
-                start_vertex = face_vertices[i]
-                end_vertex = face_vertices[(i + 1) % 3]
-                
-                # 両端点を透視投影
-                start_2d = self._project_point_perspective(start_vertex, camera_pos, 
+            # 両端点を透視投影
+            start_2d = self._project_point_perspective(start_vertex, camera_pos, 
                                                         view_vector, right_vector, up_vector,
                                                         fov, aspect_ratio, image_size)
-                end_2d = self._project_point_perspective(end_vertex, camera_pos,
+            end_2d = self._project_point_perspective(end_vertex, camera_pos,
                                                       view_vector, right_vector, up_vector,
                                                       fov, aspect_ratio, image_size)
-                
-                # 線を描画（深度シェーディング付き）
-                if start_2d is not None and end_2d is not None:
-                    # エッジの中点での深度を計算
-                    mid_vertex = (start_vertex + end_vertex) / 2
-                    depth = np.linalg.norm(mid_vertex - camera_pos)
-                    line_color = self.color_generator.apply_depth_shading([80, 80, 80], depth, max_depth)
-                    self._draw_line(img, start_2d, end_2d, line_color)
+            
+            # 線を描画（深度シェーディング付き）
+            if start_2d is not None and end_2d is not None:
+                # エッジの中点での深度を計算
+                mid_vertex = (start_vertex + end_vertex) / 2
+                depth = np.linalg.norm(mid_vertex - camera_pos)
+                line_color = self.color_generator.apply_depth_shading([80, 80, 80], depth, max_depth)
+                self._draw_line(img, start_2d, end_2d, line_color)
         
         return img
     
     def get_point_color(self, mesh: trimesh.Trimesh, face_index: int, point_index: int = None) -> List[int]:
-        """点の色をメッシュから取得（修正版）"""
+        """点の色をメッシュから取得（テクスチャ優先版）"""
         # デフォルト色（グレー）
         default_color = [150, 150, 150]
         
         try:
-            # 面の色情報をチェック（修正版）
-            if hasattr(mesh.visual, 'face_colors') and mesh.visual.face_colors is not None:
-                if face_index < len(mesh.visual.face_colors):
-                    face_color = mesh.visual.face_colors[face_index]
-                    # RGBA値の処理（0-1範囲の場合と0-255範囲の場合）
-                    if np.max(face_color[:3]) <= 1.0:
-                        # 0-1範囲の場合
-                        return [int(face_color[0] * 255), int(face_color[1] * 255), int(face_color[2] * 255)]
-                    else:
-                        # 0-255範囲の場合
-                        return [int(face_color[0]), int(face_color[1]), int(face_color[2])]
-            
-            # 頂点の色情報をチェック（修正版）
+            # 頂点の色情報を優先してチェック（テクスチャ情報）
             if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None:
                 if point_index is not None and point_index < len(mesh.visual.vertex_colors):
                     vertex_color = mesh.visual.vertex_colors[point_index]
-                    if np.max(vertex_color[:3]) <= 1.0:
-                        return [int(vertex_color[0] * 255), int(vertex_color[1] * 255), int(vertex_color[2] * 255)]
-                    else:
-                        return [int(vertex_color[0]), int(vertex_color[1]), int(vertex_color[2])]
+                    # RGBA値の処理
+                    if len(vertex_color) >= 3:
+                        if np.max(vertex_color[:3]) <= 1.0:
+                            color_rgb = [int(vertex_color[0] * 255), int(vertex_color[1] * 255), int(vertex_color[2] * 255)]
+                        else:
+                            color_rgb = [int(vertex_color[0]), int(vertex_color[1]), int(vertex_color[2])]
+                        
+                        # 有効な色かチェック（黒や白以外）
+                        if not (color_rgb == [0, 0, 0] or color_rgb == [255, 255, 255]):
+                            return color_rgb
                 
-                # 面の頂点から平均色を計算（修正版）
+                # 面の頂点から平均色を計算（テクスチャ色の保持）
                 if face_index < len(mesh.faces):
                     face_vertices = mesh.faces[face_index]
-                    colors = []
+                    valid_colors = []
+                    
                     for vertex_idx in face_vertices:
                         if vertex_idx < len(mesh.visual.vertex_colors):
-                            vert_color = mesh.visual.vertex_colors[vertex_idx][:3]
-                            if np.max(vert_color) <= 1.0:
-                                vert_color = vert_color * 255
-                            colors.append(vert_color)
+                            vertex_color = mesh.visual.vertex_colors[vertex_idx]
+                            if len(vertex_color) >= 3:
+                                if np.max(vertex_color[:3]) <= 1.0:
+                                    color = [int(vertex_color[0] * 255), int(vertex_color[1] * 255), int(vertex_color[2] * 255)]
+                                else:
+                                    color = [int(vertex_color[0]), int(vertex_color[1]), int(vertex_color[2])]
+                                
+                                # 有効な色のみ追加
+                                if not (color == [0, 0, 0] or color == [255, 255, 255]):
+                                    valid_colors.append(color)
                     
-                    if colors:
-                        avg_color = np.mean(colors, axis=0)
+                    if valid_colors:
+                        # 平均色を計算
+                        avg_color = np.mean(valid_colors, axis=0)
                         return [int(avg_color[0]), int(avg_color[1]), int(avg_color[2])]
+            
+            # 面の色情報をチェック
+            if hasattr(mesh.visual, 'face_colors') and mesh.visual.face_colors is not None:
+                if face_index < len(mesh.visual.face_colors):
+                    face_color = mesh.visual.face_colors[face_index]
+                    if np.max(face_color[:3]) <= 1.0:
+                        return [int(face_color[0] * 255), int(face_color[1] * 255), int(face_color[2] * 255)]
+                    else:
+                        return [int(face_color[0]), int(face_color[1]), int(face_color[2])]
             
             # マテリアルの色情報をチェック
             if hasattr(mesh.visual, 'material') and mesh.visual.material is not None:
@@ -689,7 +778,7 @@ class Model3DVideoCreator:
                     # 断面の色を決定（構造を示すための適切な色）
                     section_colors = self._generate_cross_section_colors(section_points, section_axis)
                     
-                    print(f"Geometric cross-section: {len(section_points)} intersection points")
+                    pass  # 詳細ログを削除
                     return section_points, section_colors
                     
             except Exception as slice_error:
@@ -1224,12 +1313,12 @@ class Model3DVideoCreator:
     
     def create_combined_frames(self, mesh: trimesh.Trimesh, points: np.ndarray, normals: np.ndarray, colors: np.ndarray,
                               num_frames: int = 60, image_size: Tuple[int, int] = (800, 600),
-                              rotation_axes: List[str] = ['x', 'y', 'z']) -> List[np.ndarray]:
+                              rotation_axes: List[str] = ['x', 'y', 'z'], include_cross_sections: bool = True) -> List[np.ndarray]:
         """統合動画のフレームを作成（グリッドレイアウト）"""
         frames = []
         
-        # グリッドサイズを計算 (3x3 グリッド)
-        grid_cols = 3  # ワイヤーフレーム、点群、断面図
+        # グリッドサイズを計算
+        grid_cols = 3 if include_cross_sections else 2  # ワイヤーフレーム、点群、(断面図)
         grid_rows = len(rotation_axes)  # 回転軸の数
         
         cell_width = image_size[0] // grid_cols
@@ -1254,9 +1343,11 @@ class Model3DVideoCreator:
             )
             
             # 断面図フレーム（メッシュも渡す）
-            cross_section_frames = self.create_cross_section_frames(
-                mesh, points, normals, colors, num_frames, (cell_width, cell_height), section_axis=axis
-            )
+            cross_section_frames = []
+            if include_cross_sections:
+                cross_section_frames = self.create_cross_section_frames(
+                    mesh, points, normals, colors, num_frames, (cell_width, cell_height), section_axis=axis
+                )
             
             all_frames[axis] = {
                 'wireframe': wireframe_frames,
@@ -1289,12 +1380,13 @@ class Model3DVideoCreator:
                                           (cell_width, cell_height))
                 combined_img[y_start:y_end, x_start:x_end] = pointcloud_img
                 
-                # 断面図 (右列)
-                x_start = 2 * cell_width
-                x_end = 3 * cell_width
-                cross_section_img = cv2.resize(all_frames[axis]['cross_section'][frame_idx], 
-                                             (cell_width, cell_height))
-                combined_img[y_start:y_end, x_start:x_end] = cross_section_img
+                # 断面図 (右列) - オプション
+                if include_cross_sections:
+                    x_start = 2 * cell_width
+                    x_end = 3 * cell_width
+                    cross_section_img = cv2.resize(all_frames[axis]['cross_section'][frame_idx], 
+                                                 (cell_width, cell_height))
+                    combined_img[y_start:y_end, x_start:x_end] = cross_section_img
             
             # グリッド線とラベルを追加
             combined_img = self._add_grid_labels(combined_img, rotation_axes, 
@@ -1304,6 +1396,7 @@ class Model3DVideoCreator:
         
         return frames
     
+    # ズーム機能は削除済み
     def _add_grid_labels(self, img: np.ndarray, rotation_axes: List[str],
                         cell_width: int, cell_height: int, frame_idx: int) -> np.ndarray:
         """グリッドにラベルと線を追加"""
@@ -1357,7 +1450,6 @@ class Model3DVideoCreator:
                              include_cross_sections: bool = True,
                              create_combined: bool = True,
                              create_individual: bool = False,
-                             enable_zoom_details: bool = True,
                              video_resolution: Tuple[int, int] = (1920, 1080)):
         """回転動画と断面図動画を作成"""
         # モデルを読み込み
@@ -1380,21 +1472,13 @@ class Model3DVideoCreator:
             print("Creating comprehensive X,Y,Z axis analysis video...")
             combined_frames = self.create_combined_frames(
                 mesh, points, normals, colors, num_frames, 
-                image_size=video_resolution, rotation_axes=['x', 'y', 'z']  # 常に全軸
+                image_size=video_resolution, rotation_axes=['x', 'y', 'z'],  # 常に全軸
+                include_cross_sections=include_cross_sections
             )
             combined_video_path = str(self.output_dir / f"{model_name}_xyz_analysis.mp4")
             self.create_video_from_frames(combined_frames, combined_video_path, fps=60)  # 高品質FPS
             
-            # ズーム詳細動画も作成
-            if enable_zoom_details:
-                print("Creating detailed zoom analysis video...")
-                zoom_frames = self.create_zoom_in_frames(
-                    mesh, points, normals, colors, num_frames // 2, 
-                    image_size=(video_resolution[0]//2, video_resolution[1]//2),
-                    zoom_factor=4.0, visualization_mode='pointcloud'
-                )
-                zoom_video_path = str(self.output_dir / f"{model_name}_zoom_details.mp4")
-                self.create_video_from_frames(zoom_frames, zoom_video_path, fps=30)
+            # ズーム詳細動画は削除済み
         
         # 個別動画を作成（オプション）
         if create_individual:
@@ -1428,8 +1512,6 @@ class Model3DVideoCreator:
         
         if create_combined:
             print(f"\n✓ Comprehensive analysis video created: {model_name}_xyz_analysis.mp4")
-            if enable_zoom_details:
-                print(f"✓ Detailed zoom analysis video created: {model_name}_zoom_details.mp4")
         if create_individual:
             print(f"\n✓ Individual videos also created")
         print(f"\nAll videos saved in: {self.output_dir}")
@@ -1437,7 +1519,7 @@ class Model3DVideoCreator:
 def main():
     parser = argparse.ArgumentParser(description="3DモデルのGemini分析用動画作成 - 高品質多角度解析")
     parser.add_argument("model_path", help="3Dモデルファイルのパス")
-    parser.add_argument("--frames", type=int, default=90, help="フレーム数 (デフォルト: 90)")
+    parser.add_argument("--frames", type=int, default=600, help="フレーム数 (デフォルト: 600)")
     parser.add_argument("--fps", type=int, default=60, help="FPS (デフォルト: 60)")
     parser.add_argument("--axes", nargs='+', default=['x', 'y', 'z'], 
                        choices=['x', 'y', 'z'], help="個別動画用回転軸 (統合動画は常にX,Y,Z全軸)")
@@ -1451,8 +1533,7 @@ def main():
                        help="個別動画も作成する")
     parser.add_argument("--no-combined", action="store_true", 
                        help="統合動画を作成しない")
-    parser.add_argument("--no-zoom", action="store_true", 
-                       help="ズーム詳細動画を作成しない")
+    # ズーム機能は削除済み
     
     args = parser.parse_args()
     
@@ -1476,7 +1557,7 @@ def main():
         include_cross_sections=not args.no_cross_sections,
         create_combined=not args.no_combined,
         create_individual=args.individual,
-        enable_zoom_details=not args.no_zoom,
+        # ズーム機能は削除済み
         video_resolution=video_resolution
     )
 

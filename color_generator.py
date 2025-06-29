@@ -10,15 +10,27 @@ class ColorGenerator:
     """3Dモデルの色生成を担当するクラス"""
     
     def generate_position_based_color(self, position: np.ndarray, bounds: np.ndarray) -> List[int]:
-        """位置ベースの色生成"""
+        """位置ベースの色生成 - 改良版"""
         try:
             # 正規化された位置を計算
             normalized_pos = self._normalize_position(position, bounds)
             
-            # HSVカラースペースで色を生成
-            hue = (normalized_pos[0] + normalized_pos[1] + normalized_pos[2]) / 3.0
-            saturation = 0.8
-            value = 0.9
+            # より豊かな色生成のため、各軸を異なる方法で組み合わせ
+            # X軸: 赤-青のグラデーション
+            # Y軸: 緑の成分として使用
+            # Z軸: 明度と彩度の調整
+            
+            # 基本的なHSV計算
+            hue = (normalized_pos[0] * 0.6 + normalized_pos[1] * 0.3) % 1.0  # 0-0.6の範囲（赤→黄→緑→青）
+            saturation = 0.7 + (normalized_pos[2] * 0.3)  # 0.7-1.0の範囲
+            value = 0.8 + (normalized_pos[1] * 0.2)  # 0.8-1.0の範囲
+            
+            # 特別な色調の調整
+            # Z軸が高い場合は青系、低い場合は赤系を強調
+            if normalized_pos[2] > 0.7:
+                hue = 0.6 + (normalized_pos[0] * 0.2)  # 青→紫
+            elif normalized_pos[2] < 0.3:
+                hue = normalized_pos[0] * 0.2  # 赤→オレンジ
             
             # HSVからRGBに変換
             rgb = colorsys.hsv_to_rgb(hue, saturation, value)
@@ -131,3 +143,51 @@ class ColorGenerator:
         except Exception as e:
             print(f"Color blending error: {e}")
             return color1
+    
+    def generate_surface_normal_color(self, normal: np.ndarray) -> List[int]:
+        """表面法線ベースの色生成"""
+        try:
+            # 法線ベクトルを正規化
+            normalized_normal = normal / (np.linalg.norm(normal) + 1e-8)
+            
+            # 法線の各成分を色に変換（-1~1 -> 0~1）
+            r = (normalized_normal[0] + 1.0) * 0.5
+            g = (normalized_normal[1] + 1.0) * 0.5  
+            b = (normalized_normal[2] + 1.0) * 0.5
+            
+            # 0-255の範囲に変換
+            return [int(r * 255), int(g * 255), int(b * 255)]
+            
+        except Exception as e:
+            print(f"Normal color generation error: {e}")
+            return [128, 128, 128]
+    
+    def generate_distance_based_color(self, position: np.ndarray, center: np.ndarray, 
+                                    max_distance: float) -> List[int]:
+        """中心点からの距離ベースの色生成"""
+        try:
+            # 中心からの距離を計算
+            distance = np.linalg.norm(position - center)
+            normalized_distance = min(distance / max_distance, 1.0)
+            
+            # 距離に基づくヒートマップ色（青→緑→黄→赤）
+            if normalized_distance < 0.25:
+                # 青→シアン
+                ratio = normalized_distance * 4
+                return [0, int(ratio * 255), 255]
+            elif normalized_distance < 0.5:
+                # シアン→緑
+                ratio = (normalized_distance - 0.25) * 4
+                return [0, 255, int((1 - ratio) * 255)]
+            elif normalized_distance < 0.75:
+                # 緑→黄
+                ratio = (normalized_distance - 0.5) * 4
+                return [int(ratio * 255), 255, 0]
+            else:
+                # 黄→赤
+                ratio = (normalized_distance - 0.75) * 4
+                return [255, int((1 - ratio) * 255), 0]
+                
+        except Exception as e:
+            print(f"Distance color generation error: {e}")
+            return [128, 128, 128]
