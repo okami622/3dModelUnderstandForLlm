@@ -6,19 +6,22 @@
 
 ### 1. 回転動画生成ツール (`create_rotation_video.py`)
 
-- X, Y, Z軸すべての回転解析を含む統合動画を生成
-- ワイヤーフレーム、点群、断面図を同時表示
-- 背面カリング、グラデーション断面表示
-- テクスチャ・マテリアル対応（OBJ+MTL, GLTF, DAE等）
-- 幾何学的断面解析（正確な円形断面）
-- スケールリファレンス表示
-- 高品質MP4出力（720p, 1080p, 4K）
-- 対応形式: PLY, OBJ, STL, OFF, GLB, GLTF, DAE, 3MF, X3D, STEP, IGES
+- **3x4グリッドレイアウト**: ワイヤーフレーム、点群、断面図、テクスチャを統合表示
+- **高品質テクスチャマッピング**: UV座標による正確なテクスチャ適用（70,000面超対応）
+- **X, Y, Z軸完全回転解析**: 各軸での360度回転を同時表示
+- **幾何学的断面解析**: 正確な平面交線による内部構造可視化
+- **matplotlibテクスチャ最適化**: Poly3DCollectionによる高速レンダリング
+- **メモリ管理最適化**: 大規模モデル対応の安定した動画生成
+- **柔軟な時間設定**: フレーム数・FPS調整による任意長動画生成
+- **高品質MP4出力**: 720p, 1080p, 4K対応
+- **対応形式**: PLY, OBJ+MTL, STL, OFF, GLB, GLTF, DAE, 3MF, X3D, STEP, IGES
 
 ### モジュール構成
 
-- `create_rotation_video.py` - メインの動画作成クラス。3Dモデルを読み込み、ワイヤーフレーム、点群、断面図の各フレームを生成し、それらを統合した動画や個別動画を作成します。
-- `texture_loader.py` - テクスチャ読み込みモジュール。OBJ, GLTF, DAEなどの形式からテクスチャやマテリアル情報を抽出し、モデルに適用します。
+- `create_rotation_video.py` - メインの動画作成クラス。3x4グリッドレイアウトでワイヤーフレーム、点群、断面図、テクスチャを統合した動画を生成します。
+- `trimesh_texture_video_creator.py` - **NEW** テクスチャ付き動画生成モジュール。UV座標とテクスチャ画像から面ごとの色を計算し、Poly3DCollectionで高品質レンダリングを実現します。
+- `texture_loader.py` - テクスチャ読み込みモジュール。OBJ+MTL, GLTF, DAEなどからテクスチャ・マテリアル情報を抽出し、モデルに適用します。
+- `open3d_video_creator.py` - Open3D高速レンダリングモジュール。大規模モデルでの効率的な動画生成をサポートします。
 - `x3d_loader.py` - X3Dファイル読み込みモジュール。XMLベースのX3D形式をパースし、trimeshで扱えるメッシュデータに変換します。
 - `color_generator.py` - 色生成・シェーディングモジュール。位置、深度、法線などの情報に基づいて、モデルに豊かな色彩を与えます。
 - `cross_section_processor.py` - 断面処理モジュール。メッシュと平面の交線を計算し、正確な幾何学的断面を生成します。
@@ -46,26 +49,30 @@ pip install -r requirements.txt
 - scipy>=1.7.0
 - opencv-python>=4.5.0
 - google-generativeai
+- open3d>=0.17.0 (高速レンダリング用)
 
 ## 使用方法
 
 ### 1. 3D回転動画の生成
 
 ```bash
-# 基本使用法
+# 基本使用法（3x4グリッド統合動画）
 python create_rotation_video.py path/to/your/model.ply
 
-# フレーム数とFPSを調整
-python create_rotation_video.py model.ply --frames 60 --fps 30
+# テクスチャ付き3x4グリッド動画生成
+python create_rotation_video.py model.obj --texture --frames 20 --fps 12
 
-# 高解像度・フレーム数指定
-python create_rotation_video.py model.obj --resolution 4k --frames 120 --fps 60
+# 高解像度テクスチャ動画
+python create_rotation_video.py model.obj --texture --resolution 1080p --frames 30
 
-# 断面図なしで個別動画作成
-python create_rotation_video.py model.obj --no-cross-sections --individual
+# 断面図なし2x3グリッド動画
+python create_rotation_video.py model.obj --no-cross-sections --frames 50 --fps 15
 
-# 統合動画を作成しない
-python create_rotation_video.py model.obj --no-combined --individual
+# テクスチャなし3x3グリッド動画  
+python create_rotation_video.py model.ply --frames 40 --fps 12
+
+# 個別動画も作成
+python create_rotation_video.py model.obj --texture --individual
 ```
 
 ### 2. AI動画解析の実行
@@ -98,28 +105,30 @@ Output/video_output_YYYYMMDD_HHMMSS/
 
 ## 統合動画の特徴
 
-**グリッドレイアウト:**
-各行が回転軸（X, Y, Z）、各列が解析タイプ（ワイヤーフレーム, 点群, 断面図）に対応したグリッドで、モデルを多角的に分析します。
+### **3x4グリッドレイアウト（フル機能版）**
+各行が回転軸（X, Y, Z）、各列が解析タイプに対応し、テクスチャ付きモデルを完全分析します。
 
 ```
-┌─────────────┬─────────────┬─────────────┐
-│ Wireframe   │ Point Cloud │Cross Section│
-├─────────────┼─────────────┼─────────────┤
-│ X-Axis      │ X-Axis      │ X-Axis      │
-├─────────────┼─────────────┼─────────────┤
-│ Y-Axis      │ Y-Axis      │ Y-Axis      │
-├─────────────┼─────────────┼─────────────┤
-│ Z-Axis      │ Z-Axis      │ Z-Axis      │
-└─────────────┴─────────────┴─────────────┘
+┌─────────────┬─────────────┬─────────────┬─────────────┐
+│ Wireframe   │ Point Cloud │Cross Section│   Texture   │
+├─────────────┼─────────────┼─────────────┼─────────────┤
+│ X-Axis      │ X-Axis      │ X-Axis      │ X-Axis      │
+├─────────────┼─────────────┼─────────────┼─────────────┤
+│ Y-Axis      │ Y-Axis      │ Y-Axis      │ Y-Axis      │
+├─────────────┼─────────────┼─────────────┼─────────────┤
+│ Z-Axis      │ Z-Axis      │ Z-Axis      │ Z-Axis      │
+└─────────────┴─────────────┴─────────────┴─────────────┘
 ```
 
-**解析機能:**
+### **解析機能:**
 
-- ✅ **ワイヤーフレーム** - 3D形状の輪郭表示
-- ✅ **点群** - 背面カリング付き点群表示
-- ✅ **断面図** - グラデーション色分け、進行状況表示
-- ✅ **同期再生** - 全軸・全解析が同時に動作
-- ✅ **詳細情報** - 軸ラベル、フレーム番号、断面位置表示
+- ✅ **ワイヤーフレーム** - 3D形状の構造表示
+- ✅ **点群** - 背面カリング付き密度可視化
+- ✅ **断面図** - 内部構造のグラデーション表示
+- ✅ **テクスチャ** - **NEW** UV座標による高品質表面材質表示
+- ✅ **同期再生** - 4つの視覚化が同時動作
+- ✅ **大規模対応** - 70,000面超のモデルに対応
+- ✅ **メモリ最適化** - 安定した長時間動画生成
 
 ## 対応3Dファイル形式
 
@@ -151,11 +160,14 @@ Output/video_output_YYYYMMDD_HHMMSS/
 - 球体断面の正確な円形表示
 - サイズ変化の正確な表現
 
-### テクスチャマッピング
+### 高品質テクスチャマッピング
 
-- UV座標による正確なテクスチャマッピング
-- 外部ファイル参照の自動検出
-- フォールバック色生成
+- **Poly3DCollection最適化**: matplotlibでの面ごとテクスチャレンダリング
+- **UV座標精密処理**: テクスチャ画像からの正確な色抽出
+- **MTLファイル解析**: OBJ+MTLの完全サポート
+- **大規模対応**: 70,000面超モデルでの安定動作
+- **メモリ管理**: 2フレームごとの最適化クリーンアップ
+- **フォールバック機能**: 頂点色・デフォルト色への自動切り替え
 
 ### 色生成
 
@@ -173,16 +185,31 @@ Output/video_output_YYYYMMDD_HHMMSS/
 
 ## 使用例
 
-### 猫モデル（テクスチャ付き）
+### 猫モデル（テクスチャ付き3x4グリッド）
 
 ```bash
-python create_rotation_video.py "sample.obj"
+# 基本テクスチャ動画（約0.3秒）
+python create_rotation_video.py "Cat_v1_l3.obj" --texture --frames 20 --fps 12
+
+# 高品質テクスチャ動画
+python create_rotation_video.py "Cat_v1_l3.obj" --texture --resolution 1080p --frames 30
 ```
 
-### 球体モデル（断面解析）
+### 球体モデル（断面解析特化）
 
 ```bash
-python create_rotation_video.py sampple.x3d --resolution 1080p
+# 3x3グリッド（断面図重視）
+python create_rotation_video.py "sphere.x3d" --resolution 1080p --frames 40 --fps 15
+```
+
+### パフォーマンス最適化例
+
+```bash
+# 軽量モデル向け（高フレーム数）
+python create_rotation_video.py "simple.ply" --frames 60 --fps 30
+
+# 大規模モデル向け（低フレーム数）
+python create_rotation_video.py "complex.obj" --texture --frames 10 --fps 10
 ```
 
 ## トラブルシューティング
@@ -204,10 +231,19 @@ python create_rotation_video.py sampple.x3d --resolution 1080p
 - OpenCVが正しくインストールされているか確認
 - 出力ディレクトリの権限を確認
 
-### メモリ不足エラー
+### メモリ不足・タイムアウトエラー
 
-- 点群数を減らす（デフォルト10000点→5000点など）
-- フレーム数を減らす（--frames 30など）
+- **テクスチャ動画**: フレーム数を減らす（--frames 10-20推奨）
+- **大規模モデル**: 解像度を下げる（--resolution 720p）
+- **点群数調整**: デフォルト10000点→5000点など
+- **FPS調整**: --fps 10-15で処理負荷軽減
+
+### テクスチャが表示されない場合
+
+- OBJ+MTLファイルの配置を確認
+- テクスチャ画像ファイル（JPG/PNG）の存在確認
+- UV座標の有無を確認
+- --textureオプションの指定確認
 
 ## APIキーの設定
 
@@ -226,8 +262,10 @@ export GOOGLE_API_KEY="your-api-key-here"
 
 ### 主要ファイル
 
-- `create_rotation_video.py` - メインの動画作成クラス
-- `texture_loader.py` - テクスチャ読み込みモジュール
+- `create_rotation_video.py` - メインの動画作成クラス（3x4グリッド統合）
+- `trimesh_texture_video_creator.py` - **NEW** テクスチャ動画生成（Poly3DCollection最適化）
+- `texture_loader.py` - テクスチャ読み込みモジュール（MTL解析）
+- `open3d_video_creator.py` - Open3D高速レンダリングモジュール
 - `x3d_loader.py` - X3Dファイル読み込みモジュール
 - `color_generator.py` - 色生成・シェーディングモジュール
 - `cross_section_processor.py` - 断面処理モジュール

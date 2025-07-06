@@ -5,3 +5,4 @@ trimesh[easy]>=4.0.0
 scipy>=1.7.0
 opencv-python>=4.5.0
 google-generativeai
+open3d>=0.17.0

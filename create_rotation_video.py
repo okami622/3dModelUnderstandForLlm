@@ -14,6 +14,9 @@ from texture_loader import TextureLoader
 from x3d_loader import X3DLoader
 from color_generator import ColorGenerator
 from cross_section_processor import CrossSectionProcessor
+from open3d_video_creator import Open3DVideoCreator
+from open3d_textured_video_creator import Open3DTexturedVideoCreator
+from trimesh_texture_video_creator import TrimeshTextureVideoCreator
 
 class Model3DVideoCreator:
     """3Dモデルの回転動画作成クラス - Gemini分析用に最適化"""
@@ -51,6 +54,9 @@ class Model3DVideoCreator:
         self.x3d_loader = X3DLoader()
         self.color_generator = ColorGenerator()
         self.cross_section_processor = CrossSectionProcessor()
+        self.open3d_creator = Open3DVideoCreator(str(output_dir))
+        self.open3d_textured_creator = Open3DTexturedVideoCreator(str(output_dir))
+        self.trimesh_texture_creator = TrimeshTextureVideoCreator(str(output_dir))
     
         
     def load_model(self, model_path: str) -> Optional[trimesh.Trimesh]:
@@ -1313,12 +1319,17 @@ class Model3DVideoCreator:
     
     def create_combined_frames(self, mesh: trimesh.Trimesh, points: np.ndarray, normals: np.ndarray, colors: np.ndarray,
                               num_frames: int = 60, image_size: Tuple[int, int] = (800, 600),
-                              rotation_axes: List[str] = ['x', 'y', 'z'], include_cross_sections: bool = True) -> List[np.ndarray]:
+                              rotation_axes: List[str] = ['x', 'y', 'z'], include_cross_sections: bool = True,
+                              include_texture: bool = False) -> List[np.ndarray]:
         """統合動画のフレームを作成（グリッドレイアウト）"""
         frames = []
         
         # グリッドサイズを計算
-        grid_cols = 3 if include_cross_sections else 2  # ワイヤーフレーム、点群、(断面図)
+        grid_cols = 2  # 基本: ワイヤーフレーム、点群
+        if include_cross_sections:
+            grid_cols += 1  # 断面図を追加
+        if include_texture:
+            grid_cols += 1  # テクスチャを追加
         grid_rows = len(rotation_axes)  # 回転軸の数
         
         cell_width = image_size[0] // grid_cols
@@ -1345,14 +1356,31 @@ class Model3DVideoCreator:
             # 断面図フレーム（メッシュも渡す）
             cross_section_frames = []
             if include_cross_sections:
+                print(f"Creating cross-section frames for {axis}-axis...")
                 cross_section_frames = self.create_cross_section_frames(
                     mesh, points, normals, colors, num_frames, (cell_width, cell_height), section_axis=axis
                 )
+                print(f"Generated {len(cross_section_frames)} cross-section frames for {axis}-axis")
+            
+            # テクスチャフレーム
+            texture_frames = []
+            if include_texture:
+                try:
+                    texture_frames = self.trimesh_texture_creator.create_enhanced_trimesh_frames(
+                        mesh, num_frames, [axis], (cell_width, cell_height)
+                    )
+                    print(f"Generated {len(texture_frames)} texture frames for {axis}-axis")
+                except Exception as e:
+                    print(f"Error generating texture frames for {axis}-axis: {e}")
+                    # フォールバック: 空のフレーム
+                    empty_frame = np.ones((cell_height, cell_width, 3), dtype=np.uint8) * 240
+                    texture_frames = [empty_frame] * num_frames
             
             all_frames[axis] = {
                 'wireframe': wireframe_frames,
                 'pointcloud': pointcloud_frames,
-                'cross_section': cross_section_frames
+                'cross_section': cross_section_frames,
+                'texture': texture_frames
             }
         
         # 統合フレームを作成
@@ -1380,17 +1408,30 @@ class Model3DVideoCreator:
                                           (cell_width, cell_height))
                 combined_img[y_start:y_end, x_start:x_end] = pointcloud_img
                 
-                # 断面図 (右列) - オプション
+                # 列の配置計算
+                col_idx = 2  # 次の列のインデックス
+                
+                # 断面図列 - オプション
                 if include_cross_sections:
-                    x_start = 2 * cell_width
-                    x_end = 3 * cell_width
+                    x_start = col_idx * cell_width
+                    x_end = (col_idx + 1) * cell_width
                     cross_section_img = cv2.resize(all_frames[axis]['cross_section'][frame_idx], 
                                                  (cell_width, cell_height))
                     combined_img[y_start:y_end, x_start:x_end] = cross_section_img
+                    col_idx += 1
+                
+                # テクスチャ列 - オプション
+                if include_texture and len(all_frames[axis]['texture']) > frame_idx:
+                    x_start = col_idx * cell_width
+                    x_end = (col_idx + 1) * cell_width
+                    texture_img = cv2.resize(all_frames[axis]['texture'][frame_idx], 
+                                           (cell_width, cell_height))
+                    combined_img[y_start:y_end, x_start:x_end] = texture_img
             
             # グリッド線とラベルを追加
             combined_img = self._add_grid_labels(combined_img, rotation_axes, 
-                                                cell_width, cell_height, frame_idx)
+                                                cell_width, cell_height, frame_idx,
+                                                include_cross_sections, include_texture)
             
             frames.append(combined_img)
         
@@ -1398,7 +1439,8 @@ class Model3DVideoCreator:
     
     # ズーム機能は削除済み
     def _add_grid_labels(self, img: np.ndarray, rotation_axes: List[str],
-                        cell_width: int, cell_height: int, frame_idx: int) -> np.ndarray:
+                        cell_width: int, cell_height: int, frame_idx: int,
+                        include_cross_sections: bool = True, include_texture: bool = False) -> np.ndarray:
         """グリッドにラベルと線を追加"""
         from PIL import Image, ImageDraw, ImageFont
         
@@ -1416,8 +1458,15 @@ class Model3DVideoCreator:
         # グリッド線を描画
         grid_color = (100, 100, 100)
         
+        # 縦線の数を動的に計算
+        total_cols = 2  # 基本: ワイヤーフレーム、点群
+        if include_cross_sections:
+            total_cols += 1
+        if include_texture:
+            total_cols += 1
+            
         # 縦線
-        for col in range(1, 3):
+        for col in range(1, total_cols):
             x = col * cell_width
             draw.line([(x, 0), (x, img.shape[0])], fill=grid_color, width=2)
         
@@ -1427,7 +1476,12 @@ class Model3DVideoCreator:
             draw.line([(0, y), (img.shape[1], y)], fill=grid_color, width=2)
         
         # ヘッダーラベル
-        header_labels = ["Wireframe", "Point Cloud", "Cross Section"]
+        header_labels = ["Wireframe", "Point Cloud"]
+        if include_cross_sections:
+            header_labels.append("Cross Section")
+        if include_texture:
+            header_labels.append("Texture")
+            
         for col, label in enumerate(header_labels):
             x = col * cell_width + cell_width // 2
             draw.text((x, 5), label, fill=(0, 0, 0), font=font, anchor="ma")
@@ -1450,6 +1504,8 @@ class Model3DVideoCreator:
                              include_cross_sections: bool = True,
                              create_combined: bool = True,
                              create_individual: bool = False,
+                             create_open3d_video: bool = False,
+                             include_texture: bool = False,
                              video_resolution: Tuple[int, int] = (1920, 1080)):
         """回転動画と断面図動画を作成"""
         # モデルを読み込み
@@ -1473,7 +1529,8 @@ class Model3DVideoCreator:
             combined_frames = self.create_combined_frames(
                 mesh, points, normals, colors, num_frames, 
                 image_size=video_resolution, rotation_axes=['x', 'y', 'z'],  # 常に全軸
-                include_cross_sections=include_cross_sections
+                include_cross_sections=include_cross_sections,
+                include_texture=include_texture
             )
             combined_video_path = str(self.output_dir / f"{model_name}_xyz_analysis.mp4")
             self.create_video_from_frames(combined_frames, combined_video_path, fps=60)  # 高品質FPS
@@ -1510,10 +1567,32 @@ class Model3DVideoCreator:
                     cross_section_video_path = str(self.output_dir / f"{model_name}_cross_section_{axis}.mp4")
                     self.create_video_from_frames(cross_section_frames, cross_section_video_path, fps)
         
+        # Open3Dテクスチャ付き動画を作成（オプション）
+        if create_open3d_video:
+            print("Creating Open3D textured rotation video...")
+            try:
+                # テクスチャ対応版を使用
+                success = self.open3d_textured_creator.create_rotation_video_with_texture(
+                    model_path,
+                    num_frames=120,  # フレーム数を固定
+                    rotation_axes=['y'],  # Y軸回転のみ（安定性重視）
+                    window_size=(1200, 900),
+                    fps=30,
+                    visible=False  # ヘッドレスモード
+                )
+                if success:
+                    print("✓ Open3D textured video created successfully")
+                else:
+                    print("✗ Open3D video creation failed")
+            except Exception as e:
+                print(f"Open3D video creation error: {e}")
+        
         if create_combined:
             print(f"\n✓ Comprehensive analysis video created: {model_name}_xyz_analysis.mp4")
         if create_individual:
             print(f"\n✓ Individual videos also created")
+        if create_open3d_video:
+            print(f"✓ Open3D textured video also created")
         print(f"\nAll videos saved in: {self.output_dir}")
 
 def main():
@@ -1533,6 +1612,10 @@ def main():
                        help="個別動画も作成する")
     parser.add_argument("--no-combined", action="store_true", 
                        help="統合動画を作成しない")
+    parser.add_argument("--open3d", action="store_true", 
+                       help="Open3Dを使用したテクスチャ付き動画も作成する")
+    parser.add_argument("--texture", action="store_true", 
+                       help="統合動画にテクスチャ列を追加する")
     # ズーム機能は削除済み
     
     args = parser.parse_args()
@@ -1557,6 +1640,8 @@ def main():
         include_cross_sections=not args.no_cross_sections,
         create_combined=not args.no_combined,
         create_individual=args.individual,
+        create_open3d_video=args.open3d,
+        include_texture=args.texture,
         # ズーム機能は削除済み
         video_resolution=video_resolution
     )
