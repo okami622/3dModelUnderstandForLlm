@@ -105,5 +105,4 @@ def generate(video_path: str):
     print(response.text)
 
 if __name__ == "__main__":
-    generate("/Users/okamiyosuke/Workspace/github/3dModelUnderstandForLlm/Output/video_output_20250706_174835/12221_Cat_v1_l3_xyz_analysis.mp4")  # 動画ファイルパスを指定
-    # generate("/path/to/your/video.mp4")  # 動画ファイルパスを指定
+    generate("/path/to/your/video.mp4")  # 動画ファイルパスを指定

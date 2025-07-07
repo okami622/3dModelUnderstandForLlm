@@ -185,23 +185,6 @@ Output/video_output_YYYYMMDD_HHMMSS/
 
 ## 使用例
 
-### 猫モデル（テクスチャ付き3x4グリッド）
-
-```bash
-# 基本テクスチャ動画（約0.3秒）
-python create_rotation_video.py "Cat_v1_l3.obj" --texture --frames 20 --fps 12
-
-# 高品質テクスチャ動画
-python create_rotation_video.py "Cat_v1_l3.obj" --texture --resolution 1080p --frames 30
-```
-
-### 球体モデル（断面解析特化）
-
-```bash
-# 3x3グリッド（断面図重視）
-python create_rotation_video.py "sphere.x3d" --resolution 1080p --frames 40 --fps 15
-```
-
 ### パフォーマンス最適化例
 
 ```bash
@@ -263,7 +246,7 @@ export GOOGLE_API_KEY="your-api-key-here"
 ### 主要ファイル
 
 - `create_rotation_video.py` - メインの動画作成クラス（3x4グリッド統合）
-- `trimesh_texture_video_creator.py` - **NEW** テクスチャ動画生成（Poly3DCollection最適化）
+- `trimesh_texture_video_creator.py` - テクスチャ動画生成（Poly3DCollection最適化）
 - `texture_loader.py` - テクスチャ読み込みモジュール（MTL解析）
 - `open3d_video_creator.py` - Open3D高速レンダリングモジュール
 - `x3d_loader.py` - X3Dファイル読み込みモジュール
@@ -279,7 +262,3 @@ export GOOGLE_API_KEY="your-api-key-here"
 - 断面の厚み
 - 色設定
 - フレーム数・FPS
-
-## ライセンス
-
-このプロジェクトはオープンソースです。
